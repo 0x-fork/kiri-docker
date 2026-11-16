@@ -514,6 +514,7 @@ pub(super) fn mount_rootfs(paths: &Paths, id: &str, image_layers: &[&str]) -> io
     valid_id(id)?;
     let base = paths.containers.join(id);
     let (upper, work, rootfs) = (base.join("upper"), base.join("work"), base.join("rootfs"));
+    let _ = sys::umount_lazy(&rootfs);
     for d in [&upper, &work, &rootfs] {
         fs::create_dir_all(d)?;
     }
@@ -736,11 +737,12 @@ pub fn sweep(paths: &Paths, cgroup: &std::path::Path) {
                 break;
             }
         }
-        if !cg.is_dir() {
-            continue;
-        }
+        // systemd removes a stopped service's cgroups (#230), so this runs
+        // whether or not the container's cgroup is still there.
         let _ = fs::remove_dir_all(PathBuf::from("/run/kiri").join(id));
-        remove_cgroup(&cg);
+        if cg.is_dir() {
+            remove_cgroup(&cg);
+        }
     }
     // Host-side veths are kv<9 characters of the id><4 hex digits>.
     let Ok(links) = fs::read_dir("/sys/class/net") else { return };
