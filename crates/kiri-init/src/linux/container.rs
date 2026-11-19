@@ -1389,40 +1389,151 @@ fn image_tree() -> Option<OwnedFd> {
 
 /// Copies a directory tree keeping modes, owners and symlinks: what Docker
 /// does to fill a new volume from the image. `from` may be a
-/// `/proc/self/fd/N` path to the image's directory (see `apply_mount`): its
-/// own owner and mode are read through the link, never off the link itself,
-/// which is root's with mode 000.
+/// `/proc/self/fd/N` path to the image's directory (see `apply_mount`): it
+/// is opened through that link (that is how the image's folder is reached)
+/// and its own owner and mode are read off the opened folder, never off the
+/// link, which is root's with mode 000.
+///
+/// This runs with the agent's full rights, before the container has its own
+/// root, and another container that already has the volume mounted can write
+/// in it meanwhile. So the volume's own folder is opened once, as its bind
+/// mount will resolve it, and nothing inside it is ever followed or looked up
+/// by path again. Every entry is made, filled and given its owner and mode through
+/// descriptors (`mkdirat`, `openat` with O_EXCL | O_NOFOLLOW, `symlinkat`,
+/// `fchown`, `fchmod`). A name that is already there is not touched: a real
+/// folder is entered and filled, anything else (a file, a link, even one
+/// pointing at a folder) stays as it is and nothing below it is copied. What
+/// is in the volume wins, as when a volume is not empty.
 fn copy_tree(from: &std::path::Path, to: &std::path::Path) -> io::Result<()> {
-    use std::os::unix::fs::{MetadataExt, PermissionsExt};
-    let meta = fs::metadata(from)?;
-    // Owner first, then mode: a chown clears set-user-ID and set-group-ID.
-    let keep = |p: &std::path::Path, m: &fs::Metadata| -> io::Result<()> {
-        let c = sys::cstr(p)?;
-        // SAFETY: valid NUL-terminated path; lchown does not follow links.
-        unsafe { libc::lchown(c.as_ptr(), m.uid(), m.gid()) };
-        if !m.file_type().is_symlink() {
-            fs::set_permissions(p, fs::Permissions::from_mode(m.mode() & 0o7777))?;
+    let src = open_at(libc::AT_FDCWD, &sys::cstr(from)?, libc::O_RDONLY | libc::O_DIRECTORY)?;
+    // The volume's own folder is opened as the bind mount of it will be: a
+    // volume folder that is a link to another disk, made on the host, still
+    // works. Everything up to and including it is the host's volume store,
+    // which no container can write in or replace; only what is inside the
+    // volume can change during the fill, and nothing inside is followed.
+    let dst = open_at(libc::AT_FDCWD, &sys::cstr(to)?, libc::O_RDONLY | libc::O_DIRECTORY)?;
+    let st = fstat_at(src.as_raw_fd(), c"", libc::AT_EMPTY_PATH)?;
+    fill_dir(src.as_fd(), dst.as_fd())?;
+    keep_owner_mode(dst.as_raw_fd(), &st)
+}
+
+/// Copies what is in the folder `src` into the folder `dst`, entry by entry.
+fn fill_dir(src: BorrowedFd<'_>, dst: BorrowedFd<'_>) -> io::Result<()> {
+    // The listing goes through our own descriptor, so a source folder that
+    // is replaced meanwhile is not the one read.
+    for entry in fs::read_dir(format!("/proc/self/fd/{}", src.as_raw_fd()))? {
+        let name = CString::new(entry?.file_name().as_bytes()).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let (s, d) = (src.as_raw_fd(), dst.as_raw_fd());
+        let st = fstat_at(s, &name, libc::AT_SYMLINK_NOFOLLOW)?;
+        match st.st_mode & libc::S_IFMT {
+            libc::S_IFLNK => {
+                let target = read_link_at(s, &name)?;
+                // SAFETY: valid NUL-terminated strings and a folder descriptor.
+                if unsafe { libc::symlinkat(target.as_ptr(), d, name.as_ptr()) } < 0 {
+                    match io::Error::last_os_error() {
+                        e if e.raw_os_error() == Some(libc::EEXIST) => continue,
+                        e => return Err(e),
+                    }
+                }
+                // SAFETY: as above. Owner only (a link has no mode of its
+                // own); by name, but never following a link.
+                unsafe { libc::fchownat(d, name.as_ptr(), st.st_uid, st.st_gid, libc::AT_SYMLINK_NOFOLLOW) };
+            }
+            libc::S_IFDIR => {
+                let sub = open_at(s, &name, libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW)?;
+                // SAFETY: a valid NUL-terminated name and a folder descriptor.
+                let made = unsafe { libc::mkdirat(d, name.as_ptr(), 0o700) } == 0;
+                if !made && io::Error::last_os_error().raw_os_error() != Some(libc::EEXIST) {
+                    return Err(io::Error::last_os_error());
+                }
+                // Whatever is there now, only a real folder is entered; a
+                // link or a file that took the name (before or during the
+                // fill) is left alone.
+                let child = match open_at(d, &name, libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW) {
+                    Ok(fd) => fd,
+                    Err(e) if matches!(e.raw_os_error(), Some(libc::ELOOP | libc::ENOTDIR | libc::ENOENT)) => continue,
+                    Err(e) => return Err(e),
+                };
+                fill_dir(sub.as_fd(), child.as_fd())?;
+                // A folder that was already there keeps its own owner and mode.
+                if made {
+                    keep_owner_mode(child.as_raw_fd(), &st)?;
+                }
+            }
+            libc::S_IFREG => {
+                // O_NONBLOCK: never wait on a file that turned into a fifo.
+                let from = open_at(s, &name, libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK)?;
+                // O_NONBLOCK does not cover a device node: what was opened
+                // must still be a regular file, or it is skipped, before
+                // anything is made at the destination. Owner and mode come
+                // from what was opened, not from the lookup by name.
+                let st = fstat_at(from.as_raw_fd(), c"", libc::AT_EMPTY_PATH)?;
+                if st.st_mode & libc::S_IFMT != libc::S_IFREG {
+                    continue;
+                }
+                // Private until the mode is set, and never an existing name.
+                let to = match open_at_mode(d, &name, libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW, 0o600) {
+                    Ok(fd) => fd,
+                    Err(e) if e.raw_os_error() == Some(libc::EEXIST) => continue,
+                    Err(e) => return Err(e),
+                };
+                let (mut from, mut to) = (fs::File::from(from), fs::File::from(to));
+                io::copy(&mut from, &mut to)?; // copy_file_range or sendfile
+                keep_owner_mode(to.as_raw_fd(), &st)?;
+            }
+            _ => {} // devices, fifos and sockets are not copied
         }
-        Ok(())
-    };
-    for entry in fs::read_dir(from)? {
-        let entry = entry?;
-        let (src, dst) = (entry.path(), to.join(entry.file_name()));
-        let m = fs::symlink_metadata(&src)?;
-        if m.file_type().is_symlink() {
-            std::os::unix::fs::symlink(fs::read_link(&src)?, &dst)?;
-        } else if m.is_dir() {
-            fs::create_dir_all(&dst)?;
-            copy_tree(&src, &dst)?;
-            continue; // copy_tree set its owner and mode
-        } else if m.is_file() {
-            fs::copy(&src, &dst)?;
-        } else {
-            continue; // devices, fifos and sockets are not copied
-        }
-        keep(&dst, &m)?;
     }
-    keep(to, &meta)
+    Ok(())
+}
+
+/// openat(2) as an owned descriptor (`O_CLOEXEC` always).
+fn open_at(dir: RawFd, name: &CStr, flags: libc::c_int) -> io::Result<OwnedFd> {
+    open_at_mode(dir, name, flags, 0)
+}
+
+fn open_at_mode(dir: RawFd, name: &CStr, flags: libc::c_int, mode: libc::mode_t) -> io::Result<OwnedFd> {
+    // SAFETY: a valid NUL-terminated name; the result is a new descriptor or -1.
+    let fd = unsafe { libc::openat(dir, name.as_ptr(), flags | libc::O_CLOEXEC, mode as libc::c_uint) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: a descriptor the kernel just returned, owned only here.
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+fn fstat_at(dir: RawFd, name: &CStr, flags: libc::c_int) -> io::Result<libc::stat> {
+    let mut st = std::mem::MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: a valid NUL-terminated name and a buffer the size of `stat`.
+    if unsafe { libc::fstatat(dir, name.as_ptr(), st.as_mut_ptr(), flags) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: fstatat filled it in.
+    Ok(unsafe { st.assume_init() })
+}
+
+fn read_link_at(dir: RawFd, name: &CStr) -> io::Result<CString> {
+    let mut buf = vec![0u8; libc::PATH_MAX as usize];
+    // SAFETY: a valid NUL-terminated name; at most `buf.len()` bytes are written.
+    let n = unsafe { libc::readlinkat(dir, name.as_ptr(), buf.as_mut_ptr().cast(), buf.len()) };
+    if n < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    buf.truncate(n as usize);
+    CString::new(buf).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+}
+
+/// The owner and the mode of `st` on the open file or folder `fd`. Owner
+/// first, then mode: a chown clears set-user-ID and set-group-ID. A refused
+/// chown (not root) is no error, as before.
+fn keep_owner_mode(fd: RawFd, st: &libc::stat) -> io::Result<()> {
+    // SAFETY: plain calls on a descriptor we own.
+    unsafe { libc::fchown(fd, st.st_uid, st.st_gid) };
+    // SAFETY: as above.
+    if unsafe { libc::fchmod(fd, st.st_mode & 0o7777) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 /// Binds `src` over `target` (relative to the container root, looked up
@@ -2299,6 +2410,362 @@ mod tests {
         assert_eq!(mode(&vol.join("conf")), 0o640);
         assert_eq!(mode(&vol.join("sub")), 0o700);
         assert_eq!(std::fs::read_link(vol.join("link")).unwrap(), std::path::Path::new("conf"));
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    /// A fresh scratch folder holding `img` (the image's folder), `vol` (the
+    /// new volume) and `out` (somewhere a container's link could point).
+    fn fill_dirs(name: &str) -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {
+        let base = std::env::temp_dir().join(format!("kiri-fill-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        for d in ["img", "vol", "out"] {
+            std::fs::create_dir_all(base.join(d)).unwrap();
+        }
+        (base.clone(), base.join("img"), base.join("vol"), base.join("out"))
+    }
+
+    fn set_mode(p: &std::path::Path, mode: u32) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(p, std::fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    fn mode_of(p: &std::path::Path) -> u32 {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::symlink_metadata(p).unwrap().mode() & 0o7777
+    }
+
+    fn names(p: &std::path::Path) -> Vec<String> {
+        let mut v: Vec<String> = std::fs::read_dir(p).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+        v.sort();
+        v
+    }
+
+    /// Another container already has the volume and put a link where the
+    /// image has a folder: the fill must not write through it.
+    #[test]
+    fn fill_leaves_a_link_named_like_a_folder_alone() {
+        let (base, img, vol, out) = fill_dirs("dirlink");
+        std::fs::create_dir_all(img.join("data/deep")).unwrap();
+        std::fs::write(img.join("data/x"), b"x").unwrap();
+        std::fs::write(img.join("data/deep/y"), b"y").unwrap();
+        set_mode(&img.join("data"), 0o700);
+        std::fs::write(out.join("keep"), b"keep").unwrap();
+        set_mode(&out, 0o755);
+        std::os::unix::fs::symlink(&out, vol.join("data")).unwrap();
+
+        super::copy_tree(&img, &vol).unwrap();
+
+        assert_eq!(names(&out), ["keep"], "nothing was made behind the link");
+        assert_eq!(mode_of(&out), 0o755, "the folder behind the link was not re-moded");
+        assert_eq!(std::fs::read_link(vol.join("data")).unwrap(), out, "the link is still a link");
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    /// The same for a link named like a file, to a file and to nothing.
+    #[test]
+    fn fill_leaves_a_link_named_like_a_file_alone() {
+        let (base, img, vol, out) = fill_dirs("filelink");
+        std::fs::write(img.join("conf"), b"from the image").unwrap();
+        std::fs::write(img.join("other"), b"from the image").unwrap();
+        std::fs::write(out.join("target"), b"outside").unwrap();
+        set_mode(&out.join("target"), 0o600);
+        std::os::unix::fs::symlink(out.join("target"), vol.join("conf")).unwrap();
+        std::os::unix::fs::symlink(out.join("not-there"), vol.join("other")).unwrap();
+
+        super::copy_tree(&img, &vol).unwrap();
+
+        assert_eq!(std::fs::read(out.join("target")).unwrap(), b"outside");
+        assert_eq!(mode_of(&out.join("target")), 0o600);
+        assert!(!out.join("not-there").exists(), "a dangling link is not created through either");
+        assert_eq!(names(&out), ["target"]);
+        assert_eq!(std::fs::read_link(vol.join("conf")).unwrap(), out.join("target"));
+        assert_eq!(std::fs::read_link(vol.join("other")).unwrap(), out.join("not-there"));
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    /// A link to an outside file whose name is a file in the image with
+    /// another mode: the outside file's mode stays.
+    #[test]
+    fn fill_does_not_re_mode_what_a_link_points_at() {
+        let (base, img, vol, out) = fill_dirs("modelink");
+        std::fs::write(img.join("secret"), b"").unwrap();
+        set_mode(&img.join("secret"), 0o777);
+        std::fs::write(out.join("target"), b"").unwrap();
+        set_mode(&out.join("target"), 0o600);
+        std::os::unix::fs::symlink(out.join("target"), vol.join("secret")).unwrap();
+
+        super::copy_tree(&img, &vol).unwrap();
+
+        assert_eq!(mode_of(&out.join("target")), 0o600);
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    /// A real folder already there is filled; a real file keeps its contents
+    /// and mode; a link where the image has a link is left too.
+    #[test]
+    fn fill_enters_a_real_folder_and_keeps_a_real_file() {
+        let (base, img, vol, _out) = fill_dirs("existing");
+        std::fs::create_dir_all(img.join("d")).unwrap();
+        std::fs::write(img.join("d/new"), b"new").unwrap();
+        std::fs::write(img.join("d/old"), b"image").unwrap();
+        std::fs::write(img.join("f"), b"image").unwrap();
+        set_mode(&img.join("f"), 0o755);
+        std::os::unix::fs::symlink("image-target", img.join("l")).unwrap();
+        std::fs::create_dir_all(vol.join("d")).unwrap();
+        set_mode(&vol.join("d"), 0o711);
+        std::fs::write(vol.join("d/old"), b"volume").unwrap();
+        std::fs::write(vol.join("f"), b"volume").unwrap();
+        set_mode(&vol.join("f"), 0o640);
+        std::os::unix::fs::symlink("volume-target", vol.join("l")).unwrap();
+
+        super::copy_tree(&img, &vol).unwrap();
+
+        assert_eq!(std::fs::read(vol.join("d/new")).unwrap(), b"new", "the folder was entered and filled");
+        assert_eq!(std::fs::read(vol.join("d/old")).unwrap(), b"volume");
+        assert_eq!(mode_of(&vol.join("d")), 0o711, "a folder that was there keeps its mode");
+        assert_eq!(std::fs::read(vol.join("f")).unwrap(), b"volume");
+        assert_eq!(mode_of(&vol.join("f")), 0o640);
+        assert_eq!(std::fs::read_link(vol.join("l")).unwrap(), std::path::Path::new("volume-target"));
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    /// A folder in the image where the volume has a file is left, and nothing
+    /// is made below it.
+    #[test]
+    fn fill_leaves_a_file_named_like_a_folder_alone() {
+        let (base, img, vol, _out) = fill_dirs("filefolder");
+        std::fs::create_dir_all(img.join("d")).unwrap();
+        std::fs::write(img.join("d/x"), b"x").unwrap();
+        std::fs::write(vol.join("d"), b"volume").unwrap();
+
+        super::copy_tree(&img, &vol).unwrap();
+
+        assert_eq!(std::fs::read(vol.join("d")).unwrap(), b"volume");
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    /// The plain case: everything is copied with its mode, links as links,
+    /// fifos skipped, an empty folder kept.
+    #[test]
+    fn fill_copies_a_plain_tree() {
+        use std::os::unix::fs::{FileTypeExt, MetadataExt};
+        let (base, img, vol, _out) = fill_dirs("plain");
+        std::fs::create_dir_all(img.join("a/b/c")).unwrap();
+        std::fs::create_dir_all(img.join("empty")).unwrap();
+        std::fs::create_dir_all(img.join("tmp")).unwrap();
+        std::fs::write(img.join("a/b/file"), b"hello").unwrap();
+        std::fs::write(img.join("a/suid"), b"#!").unwrap();
+        std::fs::write(img.join("a/sgid"), b"#!").unwrap();
+        let big = vec![7u8; 3 << 20];
+        std::fs::write(img.join("big"), &big).unwrap();
+        std::os::unix::fs::symlink("b/file", img.join("a/link")).unwrap();
+        std::os::unix::fs::symlink("/nowhere/at/all", img.join("dangling")).unwrap();
+        let fifo = super::sys::cstr(img.join("fifo")).unwrap();
+        // SAFETY: a valid NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o644) }, 0);
+        set_mode(&img.join("a/suid"), 0o4755);
+        set_mode(&img.join("a/sgid"), 0o2755);
+        set_mode(&img.join("tmp"), 0o1777);
+        set_mode(&img.join("a/b/c"), 0o750);
+        set_mode(&img.join("empty"), 0o500);
+        set_mode(&img, 0o2751);
+
+        super::copy_tree(&img, &vol).unwrap();
+
+        assert_eq!(std::fs::read(vol.join("a/b/file")).unwrap(), b"hello");
+        assert_eq!(std::fs::read(vol.join("big")).unwrap(), big);
+        assert_eq!(mode_of(&vol.join("a/suid")), 0o4755);
+        assert_eq!(mode_of(&vol.join("a/sgid")), 0o2755);
+        assert_eq!(mode_of(&vol.join("tmp")), 0o1777);
+        assert_eq!(mode_of(&vol.join("a/b/c")), 0o750);
+        assert_eq!(mode_of(&vol.join("empty")), 0o500);
+        assert!(names(&vol.join("empty")).is_empty());
+        assert_eq!(mode_of(&vol), 0o2751, "the volume's own folder gets the image folder's mode");
+        assert_eq!(std::fs::metadata(&vol).unwrap().uid(), std::fs::metadata(&img).unwrap().uid());
+        assert_eq!(std::fs::read_link(vol.join("a/link")).unwrap(), std::path::Path::new("b/file"));
+        assert_eq!(std::fs::read_link(vol.join("dangling")).unwrap(), std::path::Path::new("/nowhere/at/all"));
+        assert!(!std::fs::symlink_metadata(vol.join("a/link")).unwrap().file_type().is_dir());
+        assert!(!vol.join("fifo").exists() && std::fs::symlink_metadata(img.join("fifo")).unwrap().file_type().is_fifo());
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    /// An empty image folder gives an empty volume with the folder's mode.
+    #[test]
+    fn fill_from_an_empty_folder_keeps_its_mode() {
+        let (base, img, vol, _out) = fill_dirs("emptysrc");
+        set_mode(&img, 0o710);
+        super::copy_tree(&img, &vol).unwrap();
+        assert!(names(&vol).is_empty());
+        assert_eq!(mode_of(&vol), 0o710);
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    /// Runs the fill on a thread and fails if it has not returned in 5
+    /// seconds (a fill that waits on a fifo must not hang the test binary).
+    fn fill_bounded(img: &std::path::Path, vol: &std::path::Path) -> std::io::Result<()> {
+        let (img, vol) = (img.to_path_buf(), vol.to_path_buf());
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(super::copy_tree(&img, &vol));
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(5)).expect("the fill did not return within 5 seconds")
+    }
+
+    fn mkfifo(p: &std::path::Path) {
+        let c = std::ffi::CString::new(p.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: a valid NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+    }
+
+    fn is_fifo(p: &std::path::Path) -> bool {
+        use std::os::unix::fs::FileTypeExt;
+        std::fs::symlink_metadata(p).unwrap().file_type().is_fifo()
+    }
+
+    /// A fifo already in the volume where the image has a file: the fill
+    /// neither waits on it nor replaces it. (On main's code the open of the
+    /// fifo by path waits for ever: this fails there.)
+    #[test]
+    fn fill_leaves_a_fifo_named_like_a_file_alone() {
+        let (base, img, vol, _out) = fill_dirs("fifofile");
+        std::fs::write(img.join("pipe"), b"from the image").unwrap();
+        std::fs::write(img.join("plain"), b"plain").unwrap();
+        mkfifo(&vol.join("pipe"));
+
+        fill_bounded(&img, &vol).unwrap();
+
+        assert!(is_fifo(&vol.join("pipe")), "the fifo is still a fifo");
+        assert_eq!(std::fs::read(vol.join("plain")).unwrap(), b"plain");
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    /// A fifo in the volume where the image has a folder: nothing is made
+    /// below it, and the fill does not wait. (On main's code the fill chmods
+    /// it and the copy of the children fails on it, so the fill returns an
+    /// error there: this fails.)
+    #[test]
+    fn fill_leaves_a_fifo_named_like_a_folder_alone() {
+        let (base, img, vol, _out) = fill_dirs("fifodir");
+        std::fs::create_dir_all(img.join("data")).unwrap();
+        std::fs::write(img.join("data/x"), b"x").unwrap();
+        mkfifo(&vol.join("data"));
+
+        fill_bounded(&img, &vol).unwrap();
+
+        assert!(is_fifo(&vol.join("data")), "the fifo is still a fifo");
+        assert_eq!(names(&vol), ["data"]);
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    /// A file in the volume that is a hard link to a file outside it, named
+    /// like a file in the image: the outside file is not written or re-moded.
+    /// (On main's code the file is opened for writing and truncated, and
+    /// given the image's mode: this fails.)
+    #[test]
+    fn fill_leaves_a_hard_link_named_like_a_file_alone() {
+        let (base, img, vol, out) = fill_dirs("hardlink");
+        std::fs::write(img.join("conf"), b"from the image").unwrap();
+        set_mode(&img.join("conf"), 0o644);
+        std::fs::write(out.join("target"), b"outside, not to be touched").unwrap();
+        set_mode(&out.join("target"), 0o600);
+        std::fs::hard_link(out.join("target"), vol.join("conf")).unwrap();
+
+        fill_bounded(&img, &vol).unwrap();
+
+        assert_eq!(std::fs::read(out.join("target")).unwrap(), b"outside, not to be touched");
+        assert_eq!(mode_of(&out.join("target")), 0o600);
+        assert_eq!(std::fs::read(vol.join("conf")).unwrap(), b"outside, not to be touched");
+        assert_eq!(mode_of(&vol.join("conf")), 0o600);
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    /// A link to nothing, named like a folder in the image: nothing is
+    /// created at its target. (On main's code mkdir fails with EEXIST and
+    /// the path is then chmodded and entered by path, which fails on the
+    /// missing target, so the fill returns an error: this fails.)
+    #[test]
+    fn fill_leaves_a_dangling_link_named_like_a_folder_alone() {
+        let (base, img, vol, out) = fill_dirs("dangling");
+        std::fs::create_dir_all(img.join("data")).unwrap();
+        std::fs::write(img.join("data/x"), b"x").unwrap();
+        let gone = out.join("not-there");
+        std::os::unix::fs::symlink(&gone, vol.join("data")).unwrap();
+
+        fill_bounded(&img, &vol).unwrap();
+
+        assert!(!gone.exists(), "nothing was made at the link's target");
+        assert_eq!(std::fs::read_link(vol.join("data")).unwrap(), gone, "the link is still a link");
+        assert_eq!(names(&out), Vec::<String>::new());
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    /// Smoke test: one thread keeps swapping one name in the volume between
+    /// a real folder and a link to `out` while the main thread fills fresh
+    /// copies of the volume, for about a second. Nothing of the image may
+    /// ever appear in `out`. The only errors accepted are the ones a racing
+    /// writer can cause inside the volume: ENOENT / ENOTEMPTY / EEXIST /
+    /// ENOTDIR / ELOOP (the name was removed, replaced or filled under us).
+    /// The writer works on the volume itself, so the fill is run on the same
+    /// volume again and again; a name that is already filled is left alone.
+    /// (On main's code a fill that lands on the link writes into `out`.)
+    #[test]
+    fn fill_holds_when_a_name_keeps_changing() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let (base, img, vol, out) = fill_dirs("race");
+        std::fs::create_dir_all(img.join("data/deep")).unwrap();
+        for f in ["data/a", "data/b", "data/deep/c"] {
+            std::fs::write(img.join(f), b"from the image").unwrap();
+        }
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let writer = {
+            let (stop, vol, out) = (stop.clone(), vol.clone(), out.clone());
+            std::thread::spawn(move || {
+                let name = vol.join("data");
+                let mut link = false;
+                while !stop.load(Ordering::Relaxed) {
+                    // Remove whatever is there (a folder with files, or a
+                    // link), then put the other kind in its place.
+                    if std::fs::symlink_metadata(&name).map(|m| m.is_dir()).unwrap_or(false) {
+                        let _ = std::fs::remove_dir_all(&name);
+                    } else {
+                        let _ = std::fs::remove_file(&name);
+                    }
+                    let _ = if link { std::os::unix::fs::symlink(&out, &name) } else { std::fs::create_dir(&name) };
+                    link = !link;
+                }
+            })
+        };
+        let start = std::time::Instant::now();
+        let mut errors = Vec::new();
+        while start.elapsed() < std::time::Duration::from_secs(1) {
+            // Called directly: nothing here can make the fill wait, and a
+            // thread for every fill runs into the thread limit under load.
+            if let Err(e) = super::copy_tree(&img, &vol) {
+                match e.raw_os_error() {
+                    Some(libc::ENOENT | libc::ENOTEMPTY | libc::EEXIST | libc::ENOTDIR | libc::ELOOP) => {}
+                    _ => errors.push(e.to_string()),
+                }
+            }
+        }
+        stop.store(true, Ordering::Relaxed);
+        writer.join().unwrap();
+
+        assert_eq!(names(&out), Vec::<String>::new(), "nothing of the image was written behind the link");
+        assert!(errors.is_empty(), "unexpected errors: {errors:?}");
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    /// A volume folder that is itself a link (the volume moved to another
+    /// disk on the host) is filled where it points, as it is mounted.
+    #[test]
+    fn fill_goes_into_a_volume_folder_that_is_a_link() {
+        let (base, img, vol, out) = fill_dirs("linkedvol");
+        std::fs::write(img.join("a"), b"a").unwrap();
+        std::fs::remove_dir(&vol).unwrap();
+        std::os::unix::fs::symlink(&out, &vol).unwrap();
+        super::copy_tree(&img, &vol).unwrap();
+        assert_eq!(std::fs::read(out.join("a")).unwrap(), b"a");
+        assert!(std::fs::symlink_metadata(&vol).unwrap().file_type().is_symlink());
         std::fs::remove_dir_all(&base).unwrap();
     }
 
