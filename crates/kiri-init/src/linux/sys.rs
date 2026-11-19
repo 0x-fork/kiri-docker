@@ -325,6 +325,35 @@ pub fn open_pty() -> io::Result<(OwnedFd, OwnedFd)> {
     }
 }
 
+/// The descriptor ranges to close so that only 0, 1, 2 and `keep` stay
+/// open: (first, last), inclusive, in order.
+pub fn close_ranges(keep: &[RawFd]) -> Vec<(libc::c_uint, libc::c_uint)> {
+    let mut keep: Vec<libc::c_uint> = keep.iter().filter(|&&fd| fd > 2).map(|&fd| fd as libc::c_uint).collect();
+    keep.sort_unstable();
+    keep.dedup();
+    let mut out = Vec::with_capacity(keep.len() + 1);
+    let mut next = 3;
+    for fd in keep {
+        if fd > next {
+            out.push((next, fd - 1));
+        }
+        next = fd + 1;
+    }
+    out.push((next, libc::c_uint::MAX));
+    out
+}
+
+/// Closes the ranges `close_ranges` gave, without allocating. Before Linux
+/// 5.9 there is no close_range, and the descriptors stay open, as they
+/// always did before.
+pub fn close_now(ranges: &[(libc::c_uint, libc::c_uint)]) {
+    for &(first, last) in ranges {
+        // SAFETY: closing descriptors of this process, which the caller
+        // no longer uses.
+        unsafe { libc::syscall(libc::SYS_close_range, first, last, 0) };
+    }
+}
+
 pub fn resize_pty(fd: RawFd, rows: u16, cols: u16) {
     let ws = libc::winsize { ws_row: rows, ws_col: cols, ws_xpixel: 0, ws_ypixel: 0 };
     // SAFETY: TIOCSWINSZ with a valid winsize on a descriptor we own.
@@ -343,6 +372,44 @@ mod tests {
         assert_eq!(super::one_line("user: unknown user Bs-x\\yy\"4dd4"), "user: unknown user Bs-x\\yy\"4dd4");
         assert_eq!(super::one_line("DOM\\bob\\n"), "DOM\\bob\\n");
         assert_eq!(super::one_line("x\ny\rz"), "x y z");
+    }
+
+    #[test]
+    fn only_the_kept_descriptors_stay_open() {
+        let all = libc::c_uint::MAX;
+        assert_eq!(super::close_ranges(&[]), vec![(3, all)]);
+        // Standard streams are never closed; order and repeats don't matter.
+        assert_eq!(super::close_ranges(&[9, 2, 4, 9, 5, 0]), vec![(3, 3), (6, 8), (10, all)]);
+        assert_eq!(super::close_ranges(&[3]), vec![(4, all)]);
+        // The real thing, in a child of its own: the kept ones stay open,
+        // the rest are closed. Forked from a test with threads, so the
+        // child only makes system calls (the ranges are worked out first).
+        let (unrelated, unrelated_w) = super::pipe().unwrap();
+        let (kept, kept_w) = super::pipe().unwrap();
+        let (report, report_w) = super::pipe().unwrap();
+        use std::os::fd::AsRawFd;
+        let keep = [kept.as_raw_fd(), report_w.as_raw_fd()];
+        let ranges = super::close_ranges(&keep);
+        let check = [unrelated.as_raw_fd(), unrelated_w.as_raw_fd(), kept_w.as_raw_fd(), report.as_raw_fd()];
+        // SAFETY: the child makes only async-signal-safe system calls and
+        // leaves with _exit.
+        unsafe {
+            let pid = libc::fork();
+            assert!(pid >= 0);
+            if pid == 0 {
+                super::close_now(&ranges);
+                let open = |fd| libc::fcntl(fd, libc::F_GETFD) >= 0;
+                let mut ok = keep.iter().all(|&fd| open(fd)) && (0..3).all(open);
+                ok &= check.iter().all(|&fd| !open(fd));
+                libc::write(report_w.as_raw_fd(), if ok { b"y".as_ptr() } else { b"n".as_ptr() }.cast(), 1);
+                libc::_exit(0);
+            }
+            drop(report_w);
+            let mut said = [0u8; 1];
+            assert_eq!(libc::read(report.as_raw_fd(), said.as_mut_ptr().cast(), 1), 1, "the child said nothing");
+            libc::waitpid(pid, std::ptr::null_mut(), 0);
+            assert_eq!(&said, b"y", "a kept descriptor was closed, or another left open");
+        }
     }
 
     /// A command that may not be run ends 126 and one that is missing 127,

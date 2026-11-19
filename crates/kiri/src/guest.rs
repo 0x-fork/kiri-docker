@@ -308,7 +308,14 @@ impl Guest {
         self.conn.write_all(&self.out)?;
         loop {
             match self.read()? {
-                Msg::Started { .. } => {}
+                Msg::Started { starting: false, .. } => {}
+                // Its root is still being made (a new volume filled): ask
+                // again until it is, as the daemon's link does. A start that
+                // fails meanwhile answers with an error, and sends no exit.
+                Msg::Started { starting: true, .. } => {
+                    std::thread::sleep(Duration::from_millis(5));
+                    self.send(Msg::AwaitStart { id: req.id })?;
+                }
                 Msg::Output { stream, data, .. } => on_output(stream, data),
                 Msg::Exited(e) => {
                     return Ok(RunResult {

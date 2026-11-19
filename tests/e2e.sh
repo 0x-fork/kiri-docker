@@ -621,6 +621,13 @@ t redis-volume "PONG OK running" bash -c "$D run -d --name rv -v tredis:/data re
 # `docker run -d` must not return before the container's root is in place, or
 # an immediate exec resolves users against the host's /etc/passwd (#311).
 t volume-user-ready "passed passed passed" bash -c "$D run --name ready-seed alpine sh -c 'adduser -D dev && mkdir /payload && dd if=/dev/zero of=/payload/blob bs=1M count=64' >/dev/null && $D commit -c 'USER dev' ready-seed kiri-test/ready:1 >/dev/null && $D rm -f ready-seed >/dev/null; for i in 1 2 3; do v=ready-vol-\$i; c=\$($D run -d --mount type=volume,source=\$v,target=/payload kiri-test/ready:1 sleep 60); if $D exec --user dev \$c id >/dev/null 2>&1; then printf 'passed '; else printf 'failed '; fi; $D rm -f \$c >/dev/null; $D volume rm \$v >/dev/null 2>&1; done; $D rmi kiri-test/ready:1 >/dev/null; echo"
+# A start that fills a new volume from a big image folder still waits for the
+# fill (#311), but the engine keeps serving every other container meanwhile;
+# an exec sent to it meanwhile waits for it, a pause, a commit and a
+# container joining its network sent meanwhile all finish, and a start that
+# fails during the fill is still a start error with a whole volume
+# (tests/start-stall.sh).
+t start-stall-exec "pass:" sh "$(dirname "$0")/start-stall.sh"
 # A volume over part of a bind (`./:/app` and `/app/node_modules`) is filled
 # from the image, as Docker does, never from the host's folder under it.
 t vol-copyup-under-bind "index.html" bash -c "h=\$(mktemp -d); mkdir \$h/html; echo mac > \$h/html/from-host.txt; $D run --rm -v \$h:/usr/share/nginx -v /usr/share/nginx/html nginx:alpine sh -c 'cd /usr/share/nginx/html; [ -e from-host.txt ] && echo from the host || ls'; rm -rf \$h"
