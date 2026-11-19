@@ -530,6 +530,11 @@ t domain-ports-unchanged "$OLD_HTTP" bash -c "curl -s --unix-socket '$SOCK' http
 t domain-ports-move '"port":18780' curl -s --unix-socket "$SOCK" -X POST -d '{"http":18780,"https":18743}' http://d/kiri/domains
 t domain-ports-http "Welcome to nginx" bash -c "for i in \$(seq 20); do curl -s -m 2 http://dmv.kiri.localhost:18780 | grep -q nginx && break; sleep 0.5; done; curl -s -m 5 http://dmv.kiri.localhost:18780"
 t domain-ports-https "Welcome to nginx" curl -sk -m 5 https://dmv.kiri.localhost:18743
+# The "no such container" page lists the running containers only when asked
+# by one of this machine's own names: a page reached through DNS rebinding
+# asks with its own domain as the Host and could otherwise read the list.
+t domain-list-local "dmv.kiri.local" curl -s -m 5 -H 'Host: nope.kiri.localhost' http://127.0.0.1:18780
+t domain-list-foreign-host "listed 0" bash -c "curl -s -m 5 -H 'Host: rebind.example.com' http://127.0.0.1:18780 | grep -c dmv | sed 's/^/listed /'"
 # The old port is free afterwards: only the installed Kiri's (Kiri Dev's
 # old port 80 is the installed Kiri's own router).
 if [ -z "$FEATURE" ]; then
