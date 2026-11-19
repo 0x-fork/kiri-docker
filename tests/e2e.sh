@@ -154,6 +154,11 @@ t entrypoint "x" $D run --rm --entrypoint echo alpine x
 t entrypoint-image "nginx version" $D run --rm nginx:alpine nginx -v
 t hostname-is-id "" $D run --rm alpine hostname
 t hostname-file "" $D run --rm alpine cat /etc/hostname
+# Docker takes almost any --hostname (Compose files use underscores); only a
+# control character, which would add a line to /etc/hosts, is refused.
+t hostname-underscore "db_master" $D run --rm --hostname db_master alpine hostname
+t hostname-newline-refused "invalid hostname" $D run --rm --hostname $'db\n10.0.0.9 evil' alpine cat /etc/hosts
+t add-host-underscore "10.1.2.3" $D run --rm --add-host my_app.local:10.1.2.3 alpine getent hosts my_app.local
 t pid1 "1" $D run --rm alpine sh -c 'echo $$'
 t proc "PID" $D run --rm alpine ps
 t dev-null "ok" $D run --rm alpine sh -c 'echo x > /dev/null && echo ok'

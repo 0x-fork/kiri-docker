@@ -1042,15 +1042,21 @@ struct Mount {
 fn parse_mounts(list: StrList<'_>) -> io::Result<Vec<Mount>> {
     let mut out = Vec::with_capacity(list.len());
     for m in list.iter() {
-        let mut parts = m.split('\t');
-        let (Some(src), Some(target)) = (parts.next(), parts.next()) else {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("bad mount {m}")));
-        };
-        let flags: Vec<&str> = parts.next().unwrap_or("").split(',').filter(|f| !f.is_empty()).collect();
-        if !target.starts_with('/') || target.split('/').any(|c| c == "..") {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("bad mount target {target}")));
+        let bad = || io::Error::new(io::ErrorKind::InvalidInput, format!("bad mount {m:?}"));
+        // Three fields: source, target, flags. Seven: the same, then a
+        // volume's driver options (`type`, `device`, flags, data). Any other
+        // count is a separator inside a field — a target alone comes from an
+        // image's VOLUME line — and is refused here as well as at the host.
+        let f: Vec<&str> = m.split('\t').collect();
+        if f.len() != 3 && f.len() != 7 {
+            return Err(bad());
         }
-        let rel = target.trim_start_matches('/');
+        let (src, given_target, words) = (f[0], f[1], f[2]);
+        let flags: Vec<&str> = words.split(',').filter(|f| !f.is_empty()).collect();
+        if !given_target.starts_with('/') || given_target.split('/').any(|c| c == "..") {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("bad mount target {given_target}")));
+        }
+        let rel = given_target.trim_start_matches('/');
         let target = CString::new(if rel.is_empty() { "." } else { rel })?;
         let ro = flags.contains(&"ro");
         if flags.contains(&"tmpfs") {
@@ -1066,8 +1072,8 @@ fn parse_mounts(list: StrList<'_>) -> io::Result<Vec<Mount>> {
         if flags.contains(&"create") && fs::symlink_metadata(src).is_err() {
             fs::create_dir_all(src)?;
         }
-        if let (Some(kind), Some(device), Some(mflags), data) = (parts.next().filter(|k| !k.is_empty()), parts.next(), parts.next(), parts.next()) {
-            super::volmount::ensure(src, kind, device, mflags, data.unwrap_or(""))?;
+        if f.len() == 7 && !f[3].is_empty() {
+            super::volmount::ensure(src, f[3], f[4], f[5], f[6])?;
         }
         let meta = fs::metadata(src).map_err(|e| io::Error::new(e.kind(), format!("mount source {src}: {e}")))?;
         out.push(Mount {
@@ -1981,5 +1987,34 @@ mod tests {
         assert_eq!(super::net::mac_for([172, 17, 0, 2]), [2, 0x42, 0xac, 0x11, 0, 2]);
         assert_eq!(super::net::parse_mac("02:42:ac:11:00"), None);
         assert_eq!(super::net::parse_mac("02:42:ac:11:00:02:03"), None);
+    }
+
+    /// A mount line is three fields, or seven with a volume's driver options.
+    /// An image's VOLUME key that carries tabs would otherwise supply the
+    /// driver fields — a device to mount — so a line of any other shape is
+    /// refused here as well as where the host writes it.
+    #[test]
+    fn a_mount_line_with_forged_fields_is_refused() {
+        let net = Net { bridge: "", ip: [0; 4], prefix: 0, gateway: [0; 4], extra_hosts: &[], dns_names: &[], opts: &[] };
+        let parse = |mounts: &[&str]| {
+            let mut buf = Vec::new();
+            encode_run(&mut buf, "c1", &[], &["sh"], &[], "/", "", "c1", 0, net, mounts, &Limits::default(), 0, &[] as &[&str], &[]);
+            let Ok(Msg::Run(spec)) = decode(&buf) else { panic!("not a run") };
+            super::parse_mounts(spec.mounts)
+        };
+        // What a VOLUME key of `/app\tx\tnone\t/mnt/mac\t1000\ty` becomes.
+        let injected = "/var/lib/kiri/volumes/anon/_data\t/app\tx\tnone\t/mnt/mac\t1000\ty\tcreate,copyup";
+        let e = parse(&[injected]).err().expect("an eight-field line is refused");
+        assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(e.to_string().contains("bad mount"), "{e}");
+        // A plain mount still parses, and keeps its target and flags.
+        let dir = std::env::temp_dir().join(format!("kiri-mount-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let plain = format!("{}\t/scratch\tro", dir.display());
+        let mounts = parse(&[&plain]).unwrap();
+        assert_eq!(mounts.len(), 1);
+        assert!(mounts[0].ro);
+        assert_eq!(mounts[0].target.to_bytes(), b"scratch");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
