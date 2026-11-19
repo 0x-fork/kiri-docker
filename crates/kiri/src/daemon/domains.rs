@@ -129,6 +129,14 @@ pub fn step_aside(port: u16) -> bool {
     stepped
 }
 
+/// Whether a router serves `port` now. Containers reach the Mac's loopback
+/// through host.docker.internal (ports::host_bound), and the router routes
+/// by Host header alone: through it a container would reach every other
+/// container, whatever network it is on.
+pub fn routes(port: u16) -> bool {
+    ROUTERS.lock().unwrap_or_else(PoisonError::into_inner).iter().any(|r| r.port == port && !r.serving.lock().unwrap_or_else(PoisonError::into_inner).is_empty())
+}
+
 /// Every few seconds, a router that stepped aside tries its port again.
 fn reclaim() {
     loop {
