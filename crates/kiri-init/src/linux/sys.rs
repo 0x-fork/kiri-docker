@@ -139,6 +139,37 @@ pub fn one_line(s: &str) -> String {
     s.replace("\r\n", " ").replace(['\n', '\r'], " ")
 }
 
+/// Closes every descriptor from `first` up. For the child between clone and
+/// exec, which holds a copy of all of the agent's descriptors: close-on-exec
+/// closes them only at execve, and until then one is still a way out of the
+/// container (a working directory of `/proc/self/fd/N`).
+pub fn close_from(first: RawFd) {
+    // SAFETY: closing descriptors in this process; nothing is used after.
+    unsafe {
+        if libc::syscall(libc::SYS_close_range, first as libc::c_uint, libc::c_uint::MAX, 0) == 0 {
+            return;
+        }
+        // close_range is Linux 5.9+; older kernels close one at a time.
+        let max = match libc::sysconf(libc::_SC_OPEN_MAX) {
+            n if n > 0 => n.min(1 << 20) as RawFd,
+            _ => 1 << 16,
+        };
+        for fd in first..max {
+            libc::close(fd);
+        }
+    }
+}
+
+/// Whether the current directory is inside this process's root. The kernel
+/// gives a directory outside it as `(unreachable)/…`, which is how a
+/// working directory reached through a leaked descriptor shows.
+pub fn cwd_inside_root() -> bool {
+    let mut buf = [0u8; 4096];
+    // SAFETY: getcwd writes at most `buf.len()` bytes into `buf`.
+    let n = unsafe { libc::syscall(libc::SYS_getcwd, buf.as_mut_ptr(), buf.len()) };
+    n > 0 && buf[0] == b'/'
+}
+
 /// Writes `msg` straight to `fd` and exits without unwinding or running any
 /// destructors. Only for the child between clone and exec.
 pub fn child_fail(fd: RawFd, what: &str, err: io::Error) -> ! {

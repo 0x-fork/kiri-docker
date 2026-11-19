@@ -140,6 +140,13 @@ t workdir-created-nonroot-mode "755 root" $D run --rm -u 1000:1000 -w /made/x al
 # ... and with a read-only root, made before the root goes read-only, as in Docker.
 t workdir-created-readonly "/made/ro" $D run --rm --read-only -w /made/ro alpine pwd
 t workdir-created-readonly-nonroot "/made/ro/1000" $D run --rm --read-only -u 1000:1000 -w /made/ro/1000 alpine pwd
+# ... and inside the container, through the image's own links: alpine's
+# /var/run is a link to /run.
+t workdir-created-through-link "at /run/made" $D run --rm -w /var/run/made alpine sh -c 'echo "at $(pwd -P)"'
+# The agent's descriptors (the container's cgroup directory among them) must
+# not be a way out: a working directory of /proc/self/fd/N must never start
+# (CVE-2024-21626 in runc).
+t workdir-leaked-fd "started 0" bash -c "s=0; for n in \$(seq 3 25); do $D run --rm -w /proc/self/fd/\$n alpine true >/dev/null 2>&1 && s=\$((s+1)); done; echo started \$s"
 t user-numeric "uid=1000" $D run --rm -u 1000 alpine id
 t user-name "uid=70(postgres)" $D run --rm -u postgres postgres:17-alpine id
 t user-group "gid=0(root)" $D run --rm -u 1000:0 alpine id
@@ -211,6 +218,7 @@ code exec-exit 3 $D exec web sh -c 'exit 3'
 t exec-env "e-val" $D exec -e E=e-val web sh -c 'echo $E'
 t exec-user "nginx" $D exec -u nginx web id -un
 t exec-workdir "/etc" $D exec -w /etc web pwd
+t exec-workdir-leaked-fd "started 0" bash -c "s=0; for n in \$(seq 3 25); do $D exec -w /proc/self/fd/\$n web true >/dev/null 2>&1 && s=\$((s+1)); done; echo started \$s"
 t exec-stdin "into exec" bash -c "echo 'into exec' | $D exec -i web cat"
 t exec-tty "/dev/pts" bash -c "script -q /dev/null $D exec -it web tty < /dev/null"
 t exec-sees-pid1 "nginx" $D exec web sh -c 'cat /proc/1/comm'

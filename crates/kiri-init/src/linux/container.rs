@@ -842,15 +842,13 @@ pub(super) fn valid_id(id: &str) -> io::Result<()> {
 
 /// Creates `cwd` and its parents, 0755, when it is missing. Errors are left
 /// to the chdir after the user switch, which reports them.
-fn make_workdir(cwd: &std::ffi::CStr) {
-    // SAFETY: a valid NUL-terminated path.
-    if unsafe { libc::access(cwd.as_ptr(), libc::F_OK) } == 0 {
-        return;
-    }
-    use std::os::unix::fs::DirBuilderExt;
-    // SAFETY: the bytes came from a &str, so they are valid UTF-8.
-    let dir = unsafe { std::ffi::OsStr::from_encoded_bytes_unchecked(cwd.to_bytes()) };
-    let _ = fs::DirBuilder::new().recursive(true).mode(0o755).create(dir);
+///
+/// The path is looked up inside the container's root, one component at a
+/// time, never walked as it is: this runs while the child still holds the
+/// agent's descriptors, and a plain `mkdir -p` of `/proc/self/fd/N/..`
+/// would make directories outside the container, as root.
+fn make_workdir(root: BorrowedFd<'_>, cwd: &std::ffi::CStr) {
+    let _ = inroot::open(root, Path::new(std::ffi::OsStr::from_bytes(cwd.to_bytes())), Last::Dir);
 }
 
 fn prepare(argv: StrList<'_>, env: StrList<'_>, cwd: &str, user: &str, hostname: Option<&str>, flags: u32, caps: u64) -> io::Result<Prepared> {
@@ -1314,7 +1312,7 @@ fn container_child(p: &Prepared, rootfs: &CStr, io: &ChildStdio) -> ! {
     // Docker creates a missing working directory (mkdir -p) as root, 0755,
     // before it switches user and before the root goes read-only, so both
     // `-u 1000 -w /missing` and `--read-only -w /missing` start (#370).
-    make_workdir(&p.cwd);
+    make_workdir(root, &p.cwd);
     if p.readonly_rootfs {
         // Only the root itself: volumes, tmpfs and /dev stay as they are.
         sys::mount(c"none", c"/", c"none", libc::MS_REMOUNT | libc::MS_BIND | libc::MS_RDONLY, None).unwrap_or_else(|e| fail("read-only root", e));
@@ -1462,6 +1460,12 @@ fn finish_child(p: &Prepared, io: &ChildStdio, console: bool) -> ! {
     // The user's /etc/group memberships and --group-add, as Docker gives them.
     let groups = super::hostopts::supplementary_groups(&p.user, uid, &p.host.groups).unwrap_or_else(|e| fail("groups", e));
     give_stdio([0, 1, 2], uid).unwrap_or_else(|e| fail("stdio", e));
+    // The child holds a copy of every descriptor the agent had open, the
+    // container's cgroup directory among them. Only stdio is needed from
+    // here, so the rest go before the chdir: a working directory of
+    // `/proc/self/fd/N` (an image's WORKDIR, `-w`) would otherwise leave
+    // the process in a directory outside its root (CVE-2024-21626 in runc).
+    sys::close_from(3);
     // SAFETY: plain id-setting syscalls; `groups` outlives setgroups.
     unsafe {
         if libc::setgroups(groups.len() as _, groups.as_ptr()) != 0 || libc::setgid(gid) != 0 || libc::setuid(uid) != 0 {
@@ -1474,6 +1478,11 @@ fn finish_child(p: &Prepared, io: &ChildStdio, console: bool) -> ! {
                 fail("working directory", io::Error::last_os_error());
             }
         }
+    }
+    // And whatever the route, a working directory outside the container's
+    // root fails the start, as runc 1.1.12 does.
+    if !sys::cwd_inside_root() {
+        fail("working directory", io::Error::new(io::ErrorKind::PermissionDenied, "outside the container's root"));
     }
 
     let exe = find_executable(p).unwrap_or_else(|| {
