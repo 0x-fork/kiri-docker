@@ -13,13 +13,15 @@ use serde_json::{Value, json};
 use kiri_image::{Client, Platform, Progress, Reference};
 use kiri_proto::Stream;
 
+use super::caller::Caller;
 use super::engine::{Container, Engine, Error, ExecConfig, RestartPolicy, Spec, Status};
 use super::filters::Filters;
 use super::http::{self, Request};
 use super::time;
 
-/// Serves one client connection until it closes.
-pub fn serve(stream: UnixStream, engine: Arc<Engine>) -> io::Result<()> {
+/// Serves one client connection until it closes. `caller`: where it
+/// arrived (caller.rs), which decides whether Kiri's settings are open to it.
+pub fn serve(stream: UnixStream, engine: Arc<Engine>, caller: Caller) -> io::Result<()> {
     let mut w = stream.try_clone()?;
     let mut r = BufReader::new(stream);
     while let Some(req) = http::read_request(&mut r, streams_body)? {
@@ -36,7 +38,7 @@ pub fn serve(stream: UnixStream, engine: Arc<Engine>) -> io::Result<()> {
         if req.header("X-Kiri-Background").is_none() {
             engine.touch();
         }
-        match route(&req, &engine, &mut w, &mut r) {
+        match route(&req, &engine, caller, &mut w, &mut r) {
             // `Connection: close` or HTTP/1.0: the client reads to the end of
             // the stream (a 204 has no length to read by), which `close`
             // gives it cleanly.
@@ -117,17 +119,39 @@ fn status_of(e: Error) -> (u16, String) {
     }
 }
 
-fn route(req: &Request, engine: &Arc<Engine>, w: &mut UnixStream, r: &mut BufReader<UnixStream>) -> io::Result<Next> {
+/// Kiri's own endpoints (`/kiri/…`) that change something and that a
+/// container given the engine's socket may still call: starting the VM it
+/// already runs in (`kiri start` in a container's shell). Every other one
+/// that is not a GET (the settings, Stop, Sleep, ports, USB, the builder's
+/// limits, and any added later) is for this machine's programs only, as
+/// Docker's API has nothing that changes the engine's own settings.
+const CONTAINER_MAY: &[(&str, &str)] = &[("POST", "/kiri/wake")];
+
+/// Whether a container's connection may make this request.
+fn container_may(method: &str, path: &str) -> bool {
+    let kiri = path == "/kiri" || path.starts_with("/kiri/");
+    !kiri || matches!(method, "GET" | "HEAD") || CONTAINER_MAY.contains(&(method, path))
+}
+
+fn route(req: &Request, engine: &Arc<Engine>, caller: Caller, w: &mut UnixStream, r: &mut BufReader<UnixStream>) -> io::Result<Next> {
     if req.api_version.is_some_and(|v| v < http::MIN_API_VERSION) {
         let (major, minor) = req.api_version.unwrap_or_default();
         let (min_major, min_minor) = http::MIN_API_VERSION;
         return reply(w, Err(Error::BadRequest(format!("client version {major}.{minor} is too old. Minimum supported API version is {min_major}.{min_minor}, please upgrade your client to a newer version"))), 200);
     }
+    let p = req.path.as_str();
+    let m = req.method.as_str();
+    // Kiri's own endpoints that change something are for this machine's
+    // programs (caller.rs), not for a container given the socket.
+    if caller == Caller::Container && !container_may(m, p) {
+        // Closed after the answer: a body the request carried is not left
+        // on the connection to be read as the next request.
+        http::error(w, 403, "this is changed in Kiri's window or with the kiri command on this machine, not from a container")?;
+        return Ok(Next::Close);
+    }
     if let Some(done) = super::ops::route(req, engine, w) {
         return done;
     }
-    let p = req.path.as_str();
-    let m = req.method.as_str();
     match (m, p) {
         ("GET" | "HEAD", "/_ping") => {
             // Builder-Version 1: the classic POST /build, which Kiri serves
@@ -151,6 +175,9 @@ fn route(req: &Request, engine: &Arc<Engine>, w: &mut UnixStream, r: &mut BufRea
         ("GET", "/kiri/proxy") => return reply(w, Ok(super::proxy::report()), 200),
         ("POST", "/kiri/proxy") => return reply(w, set_proxy(req), 200),
         ("PUT", "/kiri/proxy/system") => return reply(w, set_host_proxy(req), 200),
+        // daemon.json's registry keys: Settings → Registries, `kiri registry`.
+        ("GET", "/kiri/registries") => return reply(w, Ok(super::daemon_json::report()), 200),
+        ("POST", "/kiri/registries") => return reply(w, set_registries(req, engine), 200),
         ("GET", "/kiri/resources") => return reply(w, Ok(resources(engine)), 200),
         // Settings → Domains: the container-domain routers' ports.
         ("GET", "/kiri/domains") => return reply(w, Ok(super::domains::report()), 200),
@@ -281,8 +308,8 @@ fn route(req: &Request, engine: &Arc<Engine>, w: &mut UnixStream, r: &mut BufRea
                     Err(e) => return reply(w, Err(e), 204),
                     _ => {}
                 }
-                super::builder::before_start(engine, id);
-                return reply(w, engine.start(id).map(|()| Value::Null), 204);
+                let started = super::builder::start(engine, id).unwrap_or_else(|| engine.start(id));
+                return reply(w, started.map(|()| Value::Null), 204);
             }
             ("POST", "stop") => {
                 let t = stop_timeout(req, engine, id);
@@ -301,8 +328,7 @@ fn route(req: &Request, engine: &Arc<Engine>, w: &mut UnixStream, r: &mut BufRea
                 let r = engine.stop(id, t).and_then(|_| {
                     // Wait for the exit to be recorded before starting again.
                     engine.wait(id, "not-running")?;
-                    super::builder::before_start(engine, id);
-                    engine.start(id)
+                    super::builder::start(engine, id).unwrap_or_else(|| engine.start(id))
                 });
                 return reply(w, r.map(|()| Value::Null), 204);
             }
@@ -314,7 +340,10 @@ fn route(req: &Request, engine: &Arc<Engine>, w: &mut UnixStream, r: &mut BufRea
             ("POST", "attach") => return attach(req, engine, id, w, r),
             ("GET", "logs") => return logs(req, engine, id, w),
             ("POST", "resize") => return reply(w, resize(req, engine, id).map(|()| json!({})), 200),
-            ("POST", "exec") => return reply(w, exec_create(req, engine, id), 201),
+            ("POST", "exec") => {
+                super::builder::before_exec(engine, id);
+                return reply(w, exec_create(req, engine, id), 201);
+            }
             ("HEAD" | "GET", "archive") => return archive_get(req, engine, id, w),
             ("PUT", "archive") => return archive_put(req, engine, id, w, r),
             ("DELETE", "") => return reply(w, engine.remove(id, req.flag("force"), req.flag("v")).map(|()| Value::Null), 204),
@@ -477,6 +506,10 @@ fn info(engine: &Engine) -> Value {
         // Not in Docker's /info (the ping's Builder-Version header is), but
         // tools print it: the classic builder API, served by builder.rs.
         "BuilderVersion": "1",
+        // `docker info`'s Registry, Insecure Registries and Registry Mirrors:
+        // daemon.json's, as Docker reports its own.
+        "IndexServerAddress": "https://index.docker.io/v1/",
+        "RegistryConfig": super::daemon_json::info(),
         "KiriAgentMemory": engine.agent_rss().unwrap_or(0),
         "KiriVmAwake": engine.is_awake(),
         "KiriStopped": engine.is_stopped(),
@@ -950,6 +983,28 @@ fn set_proxy(req: &Request) -> Result<Value, Error> {
     Ok(super::proxy::report())
 }
 
+fn set_registries(req: &Request, engine: &Engine) -> Result<Value, Error> {
+    set_registries_with(req, super::daemon_json::set, || super::builder::refresh(engine))
+}
+
+fn set_registries_with(
+    req: &Request,
+    save: impl FnOnce(&Value) -> Result<(Value, bool), String>,
+    refresh: impl FnOnce(),
+) -> Result<Value, Error> {
+    let body: Value = serde_json::from_slice(&req.body).map_err(|e| Error::BadRequest(format!("invalid JSON: {e}")))?;
+    let (report, changed) = save(&body).map_err(Error::BadRequest)?;
+    // BuildKit reads its registries from buildkitd.toml at each start; an
+    // unchanged save leaves the builder alone. A stopped builder gets the
+    // new file now if nothing holds ENSURE; a running one is left to the
+    // next build or the idle watch rather than stopped from a detached
+    // thread after this save has answered.
+    if changed {
+        refresh();
+    }
+    Ok(report)
+}
+
 fn set_domain_ports(req: &Request, engine: &Arc<Engine>) -> Result<Value, Error> {
     let body: Value = serde_json::from_slice(&req.body).map_err(|e| Error::BadRequest(format!("invalid JSON: {e}")))?;
     let port = |k: &str| body[k].as_u64().and_then(|p| u16::try_from(p).ok()).filter(|&p| p != 0).ok_or_else(|| Error::BadRequest(format!("{k} must be a port from 1 to 65535")));
@@ -1127,6 +1182,12 @@ fn run_pull(req: &Request, engine: &Engine, reference: &Reference, job: &super::
     let client = client_for(req);
     let on_progress = |p: Progress| match p {
         Progress::Resolved { .. } | Progress::Layer { cached: true, .. } => {}
+        // A mirror that did not have the image: say which, and carry on.
+        Progress::MirrorFallback { mirror, reason } => {
+            let reason: String = reason.chars().take(120).collect();
+            line(json!({"status": format!("{mirror}: {reason}; trying the next registry")}));
+        }
+        Progress::FromMirror { mirror } => line(json!({"status": format!("Pulled from the mirror {mirror}")})),
         // Docker's own lines, so `docker pull` draws its bars; `size` is
         // extra, for the window's overall bar, and the CLI ignores it.
         Progress::Layer { digest, size, .. } => line(json!({"status": "Pulling fs layer", "progressDetail": {}, "id": short(&digest), "size": size})),
@@ -1383,18 +1444,33 @@ fn guest_bind_source(src: &str) -> String {
 /// The guest mount lines with each Mac bind source followed again from the
 /// path the person gave (kept in `info`, one entry per line). Links are
 /// resolved when the container is made; this redoes it at start, so a link
-/// re-pointed since then leads to its new target. Lines that aren't a bind
-/// of the Mac's files stay as they are.
+/// re-pointed since then leads to its new target. On a Linux host (and
+/// WSL) only a bind of the engine's socket is looked at again, so a
+/// container made before Kiri gave containers a socket of their own gets
+/// it now: by the path the person gave, or else by the path mounted when
+/// it was made, every line, whether or not `info` has one for it. Other
+/// lines stay as they are.
 pub(super) fn fresh_bind_sources(guest: &[String], info: &[Value]) -> Vec<String> {
-    if !cfg!(target_os = "macos") || guest.len() != info.len() {
+    fresh_bind_sources_with(guest, info, super::binds::engine_socket, cfg!(target_os = "macos"))
+}
+
+fn fresh_bind_sources_with(guest: &[String], info: &[Value], engine_socket: impl Fn(&str) -> Option<String>, mac: bool) -> Vec<String> {
+    let paired = guest.len() == info.len();
+    if mac && !paired {
         return guest.to_vec();
     }
     guest
         .iter()
-        .zip(info)
-        .map(|(line, i)| {
-            let (Some(src), Some((old, rest))) = (i["Source"].as_str().filter(|_| i["Type"] == "bind"), line.split_once('\t')) else { return line.clone() };
-            if !old.strip_prefix(MAC_ROOT).is_some_and(|p| p.starts_with('/')) || super::binds::engine_socket(src).is_some() {
+        .enumerate()
+        .map(|(idx, line)| {
+            let Some((old, rest)) = line.split_once('\t') else { return line.clone() };
+            let src = info.get(idx).filter(|i| paired && i["Type"] == "bind").and_then(|i| i["Source"].as_str());
+            if !mac {
+                let given = src.and_then(&engine_socket).or_else(|| old.starts_with('/').then(|| engine_socket(old)).flatten());
+                return given.map_or_else(|| line.clone(), |given| format!("{given}\t{rest}"));
+            }
+            let Some(src) = src else { return line.clone() };
+            if !old.strip_prefix(MAC_ROOT).is_some_and(|p| p.starts_with('/')) || engine_socket(src).is_some() {
                 return line.clone();
             }
             format!("{}\t{rest}", guest_bind_source(src))
@@ -3611,7 +3687,7 @@ mod tests {
     }
 
     fn test_image(name: &str) -> kiri_image::Image {
-        kiri_image::Image {
+        kiri_image::Image { mirror: None,
             name: name.into(), digest: "sha256:0123".into(), index_digest: None, config_digest: "sha256:0123".into(),
             layers: Vec::new(), size: 0, platform: "linux/arm64".into(), created: String::new(), pulled_at: 0, config: Default::default(),
         }
@@ -3997,7 +4073,7 @@ mod tests {
             let (mut client, server) = UnixStream::pair().unwrap();
             let served = std::thread::spawn({
                 let engine = engine.clone();
-                move || serve(server, engine)
+                move || serve(server, engine, Caller::Host)
             });
             client.write_all(requests.as_bytes()).unwrap();
             client.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
@@ -4030,6 +4106,154 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    /// The `(method, path)` routes a `route` function's body matches, read
+    /// from its source: single or `|`-separated methods, a literal
+    /// `/kiri…` path or a `p.strip_prefix("/kiri/…")` guard (with an
+    /// optional `strip_suffix`). Any other line naming a `/kiri` path (an
+    /// arm split over lines, a method in a variable) fails the test rather
+    /// than going unseen; a handler repeating its arm's `strip_prefix` is
+    /// fine.
+    fn kiri_routes(body: &str) -> Vec<(String, String)> {
+        let mut routes: Vec<(String, String)> = Vec::new();
+        let mut prefixes: Vec<String> = Vec::new();
+        for line in body.lines().map(str::trim).filter(|l| !l.starts_with("//")) {
+            let names_kiri = line.contains("\"/kiri");
+            let arm = line.strip_prefix('(').filter(|r| r.starts_with('"')).and_then(|r| {
+                let (methods, rest) = r.split_once(", ")?;
+                let methods: Option<Vec<&str>> = methods.split('|').map(|m| m.trim().strip_prefix('"')?.strip_suffix('"')).collect();
+                Some((methods?, rest))
+            });
+            let path = arm.as_ref().and_then(|(_, rest)| {
+                if let Some(lit) = rest.strip_prefix("\"/kiri") {
+                    Some(format!("/kiri{}", lit.split('"').next()?))
+                } else if let Some(i) = rest.find("strip_prefix(\"/kiri/") {
+                    let prefix = rest[i + "strip_prefix(\"".len()..].split('"').next()?;
+                    let suffix = rest.split("strip_suffix(\"").nth(1).map_or("", |s| s.split('"').next().unwrap_or_default());
+                    Some(format!("{prefix}1{suffix}"))
+                } else {
+                    None
+                }
+            });
+            match (arm, path) {
+                (Some((methods, _)), Some(path)) => {
+                    if let Some(i) = line.find("strip_prefix(\"/kiri/") {
+                        prefixes.push(line[i..].split('"').nth(1).unwrap_or_default().to_owned());
+                    }
+                    routes.extend(methods.iter().map(|m| ((*m).to_owned(), path.clone())));
+                }
+                _ if names_kiri => {
+                    let repeats = line.find("strip_prefix(\"/kiri/").is_some_and(|i| prefixes.iter().any(|p| line[i..].split('"').nth(1) == Some(p.as_str())));
+                    assert!(repeats, "a /kiri path the route reader cannot read: {line}");
+                }
+                _ => {}
+            }
+        }
+        routes
+    }
+
+    /// Every one of Kiri's own endpoints that changes something is refused
+    /// on a container's connection, unless listed in `CONTAINER_MAY`; GETs
+    /// and HEADs stay open. The routes are read from `route` itself and
+    /// from `ops::route` (which it asks first), so one added later is
+    /// covered too.
+    #[test]
+    fn a_container_changes_nothing_through_kiris_own_endpoints() {
+        let body_of = |src: &'static str, start: &str| {
+            let body = &src[src.find(start).unwrap()..];
+            &body[..body.find("\n}\n").unwrap()]
+        };
+        let mut routes = kiri_routes(body_of(include_str!("api.rs"), "\nfn route("));
+        routes.extend(kiri_routes(body_of(include_str!("ops.rs"), "\npub fn route(")));
+        for known in [("POST", "/kiri/stop"), ("POST", "/kiri/sleep"), ("POST", "/kiri/registries"), ("PUT", "/kiri/proxy/system"), ("POST", "/kiri/builder"), ("POST", "/kiri/containers/1/ports"), ("DELETE", "/kiri/k8s/forward/1")] {
+            assert!(routes.iter().any(|(m, p)| (m.as_str(), p.as_str()) == known), "{known:?} not found in route(): {routes:?}");
+        }
+        for (m, p) in &routes {
+            let open = matches!(m.as_str(), "GET" | "HEAD") || CONTAINER_MAY.contains(&(m.as_str(), p.as_str()));
+            assert_eq!(container_may(m, p), open, "{m} {p}");
+        }
+        assert!(!container_may("PATCH", "/kiri/anything/new"));
+        assert!(!container_may("POST", "/kiri"));
+        assert!(container_may("POST", "/containers/create") && container_may("GET", "/kiri/registries") && container_may("HEAD", "/kiri/registries"));
+        // The reader itself: arms of several methods are read as each, and
+        // a /kiri path it cannot read stops the test.
+        let read = kiri_routes("        (\"POST\" | \"DELETE\", \"/kiri/x\") => {}\n        (\"GET\" | \"HEAD\", p) if p.strip_prefix(\"/kiri/y/\").is_some() => {\n            go(p.strip_prefix(\"/kiri/y/\"));\n        }");
+        assert_eq!(read, [("POST".to_owned(), "/kiri/x".to_owned()), ("DELETE".into(), "/kiri/x".into()), ("GET".into(), "/kiri/y/1".into()), ("HEAD".into(), "/kiri/y/1".into())]);
+        for unreadable in ["        (m, \"/kiri/z\") => {}", "        (\"POST\",\n            \"/kiri/z\") => {}"] {
+            assert!(std::panic::catch_unwind(|| kiri_routes(unreadable)).is_err(), "{unreadable}");
+        }
+    }
+
+    /// Through the API itself: a container's Stop and settings are refused,
+    /// and the engine stays as it was.
+    #[test]
+    fn a_containers_stop_and_settings_are_refused() {
+        use std::io::{Read, Write};
+        let (root, engine) = engine_in("container-gate", false);
+        for req in ["POST /v1.47/kiri/stop", "POST /kiri/sleep", "POST /kiri/registries", "POST /kiri/proxy", "POST /kiri/resources", "POST /kiri/domains", "DELETE /kiri/domains"] {
+            let (mut client, server) = UnixStream::pair().unwrap();
+            let served = std::thread::spawn({
+                let engine = engine.clone();
+                move || serve(server, engine, Caller::Container)
+            });
+            client.write_all(format!("{req} HTTP/1.1\r\nHost: d\r\nConnection: close\r\nContent-Length: 2\r\n\r\n{{}}").as_bytes()).unwrap();
+            let mut got = String::new();
+            client.read_to_string(&mut got).unwrap();
+            served.join().unwrap().unwrap();
+            assert!(got.starts_with("HTTP/1.1 403 "), "{req}: {got}");
+        }
+        // Refused, the connection ends after the answer even when the
+        // client asked to keep it: the body is not read as a request.
+        let (mut client, server) = UnixStream::pair().unwrap();
+        let served = std::thread::spawn({
+            let engine = engine.clone();
+            move || serve(server, engine, Caller::Container)
+        });
+        client.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        client.write_all(b"POST /kiri/registries HTTP/1.1\r\nHost: d\r\nContent-Length: 2\r\n\r\n{}").unwrap();
+        let mut got = String::new();
+        client.read_to_string(&mut got).unwrap();
+        served.join().unwrap().unwrap();
+        assert!(got.starts_with("HTTP/1.1 403 "), "{got}");
+        // What a container may do still answers: the registry lists are
+        // readable from one.
+        let (mut client, server) = UnixStream::pair().unwrap();
+        let served = std::thread::spawn({
+            let engine = engine.clone();
+            move || serve(server, engine, Caller::Container)
+        });
+        client.write_all(b"GET /kiri/registries HTTP/1.1\r\nHost: d\r\nConnection: close\r\n\r\n").unwrap();
+        let mut got = String::new();
+        client.read_to_string(&mut got).unwrap();
+        served.join().unwrap().unwrap();
+        assert!(got.starts_with("HTTP/1.1 200 "), "{got}");
+        drop(engine);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// `POST /kiri/registries` refreshes synchronously on the request thread
+    /// only when the save changed settings, never from a detached thread after
+    /// answering.
+    #[test]
+    fn set_registries_refreshes_synchronously_without_a_detached_thread() {
+        let req = Request::internal("POST", "/kiri/registries", &[], b"{}".to_vec());
+        let caller = std::thread::current().id();
+        let ran = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let ran2 = ran.clone();
+        set_registries_with(&req, |_| Ok((json!({}), true)), move || {
+            *ran2.lock().unwrap() = Some(std::thread::current().id());
+        })
+        .unwrap();
+        assert_eq!(*ran.lock().unwrap(), Some(caller), "refresh must finish on the caller thread before answering");
+
+        let ran = std::sync::Arc::new(std::sync::Mutex::new(false));
+        let ran2 = ran.clone();
+        set_registries_with(&req, |_| Ok((json!({}), false)), move || {
+            *ran2.lock().unwrap() = true;
+        })
+        .unwrap();
+        assert!(!*ran.lock().unwrap(), "unchanged save must not refresh");
+    }
+
     /// A pull sent with a body, as docker-modem (so Testcontainers for Node)
     /// sends its options as JSON, doesn't leave that body to be read as the
     /// start of the next request on the connection: it used to answer
@@ -4043,7 +4267,7 @@ mod tests {
             let (mut client, server) = UnixStream::pair().unwrap();
             let served = std::thread::spawn({
                 let engine = engine.clone();
-                move || serve(server, engine)
+                move || serve(server, engine, Caller::Host)
             });
             client.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
             // Written from a thread: a body larger than the socket buffer
@@ -4107,7 +4331,7 @@ mod tests {
             let t = std::time::Instant::now();
             let served = std::thread::spawn({
                 let engine = engine.clone();
-                move || (serve(server, engine), t.elapsed())
+                move || (serve(server, engine, Caller::Host), t.elapsed())
             });
             client.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
             let sent = std::thread::spawn({
@@ -4193,7 +4417,7 @@ mod tests {
             let (mut client, server) = UnixStream::pair().unwrap();
             let served = std::thread::spawn({
                 let engine = engine.clone();
-                move || serve(server, engine)
+                move || serve(server, engine, Caller::Host)
             });
             write!(client, "POST /images/load?quiet=0 HTTP/1.1\r\nHost: docker\r\nContent-Type: application/x-tar\r\nContent-Length: {}\r\n\r\n", body.len()).unwrap();
             client.write_all(body).unwrap();
@@ -4328,6 +4552,29 @@ mod tests {
         assert_eq!(mac_source(dir.join("link").to_str().unwrap()).as_deref(), real.to_str());
         assert_eq!(mac_source("/tmp/kiri-no-such-path").as_deref(), Some("/tmp/kiri-no-such-path"));
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// On a Linux host a bind of the engine's socket made before Kiri gave
+    /// containers a socket of their own gets it at the next start; other
+    /// binds are mounted as they were made.
+    #[test]
+    fn a_socket_bind_made_earlier_is_given_the_container_socket_at_start() {
+        let guest = vec!["/run/kiri/docker.sock\t/var/run/docker.sock\t".to_owned(), "/srv/app\t/x\tro".to_owned(), "tmpfs\t/t\ttmpfs".to_owned()];
+        let info = vec![json!({"Type": "bind", "Source": "/var/run/docker.sock"}), json!({"Type": "bind", "Source": "/srv/app"}), json!({"Type": "tmpfs", "Source": ""})];
+        let sock = |s: &str| matches!(s, "/var/run/docker.sock" | "/run/kiri/docker.sock").then(|| "/run/kiri/docker.container.sock".to_owned());
+        let given = ["/run/kiri/docker.container.sock\t/var/run/docker.sock\t", "/srv/app\t/x\tro", "tmpfs\t/t\ttmpfs"];
+        assert_eq!(fresh_bind_sources_with(&guest, &info, sock, false), given);
+        // The path the person gave no longer leads to the socket (a link
+        // removed or re-pointed): the path mounted when it was made does.
+        let moved = vec![json!({"Type": "bind", "Source": "/home/me/sock-link"}), info[1].clone(), info[2].clone()];
+        assert_eq!(fresh_bind_sources_with(&guest, &moved, sock, false), given);
+        // Records that don't pair one to one with the mount lines: each
+        // line is still looked at by the path it mounts.
+        assert_eq!(fresh_bind_sources_with(&guest, &info[1..], sock, false), given);
+        assert_eq!(fresh_bind_sources_with(&guest, &[], sock, false), given);
+        // A Mac follows binds from the records only, so it leaves unpaired
+        // lines as they are.
+        assert_eq!(fresh_bind_sources_with(&guest, &info[1..], sock, true), guest);
     }
 
     /// A linked bind source is followed again at each start: re-pointing the
@@ -4971,7 +5218,7 @@ mod leave_first_network_tests {
         std::fs::create_dir_all(&root).unwrap();
         let engine = super::super::engine::boot_without_vm(&root);
         engine.lock_net().create("probe-net", Default::default()).unwrap();
-        let image = kiri_image::Image {
+        let image = kiri_image::Image { mirror: None,
             name: "test:1".into(), digest: "sha256:0123".into(), index_digest: None, config_digest: "sha256:0123".into(),
             layers: Vec::new(), size: 0, platform: "linux/arm64".into(), created: String::new(), pulled_at: 0, config: Default::default(),
         };

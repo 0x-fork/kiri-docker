@@ -556,6 +556,36 @@ fn proxy(save: Option<serde_json::Value>) {
     }
 }
 
+/// Settings → Registries: reads (or saves, then reads) daemon.json's
+/// insecure registries and Docker Hub mirrors. The answer to a save says
+/// whether it was saved (`saved`), so the page knows its own save's answer
+/// from a read that crossed it.
+fn registry_config(save: Option<serde_json::Value>) {
+    let saved = save.map(|body| match client::request("POST", "/kiri/registries", Some(&body)) {
+        Ok(r) if r.ok() => {
+            emit(notice("ok", &tr("Registry settings saved")));
+            true
+        }
+        Ok(r) => {
+            emit(notice("error", &trf("Could not save the registry settings: {error}", &[("error", &r.error())])));
+            false
+        }
+        Err(e) => {
+            emit(notice("error", &trf("Could not save the registry settings: {error}", &[("error", &e)])));
+            false
+        }
+    });
+    let mut v = match client::get("/kiri/registries") {
+        Ok(v) => v,
+        Err(e) => serde_json::json!({"error": e.to_string()}),
+    };
+    v["type"] = "registryconfig".into();
+    if let Some(saved) = saved {
+        v["saved"] = saved.into();
+    }
+    emit(v.to_string());
+}
+
 /// Settings → Domains: reads (or moves, then reads) the routers' ports.
 fn router_ports(set: Option<serde_json::Value>) {
     if let Some(body) = set {
@@ -1930,6 +1960,16 @@ fn handle(text: &str, tx: &Sender<Cmd>, autostart: bool, view: Option<&str>) {
         "setproxy" => {
             let body = msg.value;
             std::thread::spawn(move || proxy(Some(body)));
+            Ok(())
+        }
+        // Settings → Registries: daemon.json's lists.
+        "registryconfig" => {
+            std::thread::spawn(|| registry_config(None));
+            Ok(())
+        }
+        "setregistryconfig" => {
+            let body = msg.value;
+            std::thread::spawn(move || registry_config(Some(body)));
             Ok(())
         }
         // Settings → Domains: the routers' ports.

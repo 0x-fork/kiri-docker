@@ -215,34 +215,281 @@ fn create(engine: &Engine, say: &mut dyn FnMut(&str)) -> Result<String, Error> {
     crate::diag::info!("builder created", name = name);
     let id = made["Id"].as_str().unwrap_or_default().to_owned();
     // Before its first start, whoever starts it (buildx, for one).
-    write_config(engine, &id);
+    let _ = write_config(engine, &id);
     Ok(id)
 }
 
 /// `POST /containers/<builder>/start` from buildx (its docker-container
-/// driver starts the container itself): the config is written first, as
-/// for the daemon's own starts, so the mirror address and the cache limit
-/// are today's, not whatever the container was made with (an older Kiri's
-/// mirror address, a bridge gateway that has since moved).
-pub fn before_start(engine: &Engine, key: &str) {
-    let Some((id, status)) = find(engine) else { return };
-    let key = key.trim_start_matches('/');
-    if status == Status::Running || !(key == container_name() || (key.len() >= 6 && id.starts_with(key))) {
-        return;
-    }
-    let _g = ENSURE.lock().unwrap_or_else(|e| e.into_inner());
-    write_config(engine, &id);
+/// driver starts the container itself), and the start half of `/restart`:
+/// for Kiri's builder, writes today's config (when not already running) and
+/// starts it under [`ENSURE`], so the mirror address, cache limit and
+/// registries are today's and nothing comes between writing the config and
+/// starting the container. `None` for any other container.
+pub fn start(engine: &Engine, key: &str) -> Option<Result<(), Error>> {
+    // One lookup for a start of any other container.
+    let Ok(true) = engine.with(key, |c| c.name == container_name()) else { return None };
+    start_with(
+        &ENSURE,
+        || find(engine).map(|(id, st)| (id, st == Status::Running)),
+        |id| write_config(engine, id),
+        |id| {
+            let started = engine.start(id);
+            if started.is_ok() {
+                LAST_USE.store(now_secs(), Ordering::Relaxed);
+            }
+            started
+        },
+    )
 }
 
-/// The garbage collector's limits, for buildkitd's next start.
-fn write_config(engine: &Engine, id: &str) {
-    let archive = tar(&[("buildkit/", None), ("buildkit/buildkitd.toml", Some(config_toml(cache_limit(), &super::mirror::config(engine)).as_bytes()))]);
-    if let Err(e) = copy_in(engine, id, "/etc", &mut io::Cursor::new(archive)) {
+fn start_with(
+    lock: &Mutex<()>,
+    find: impl FnOnce() -> Option<(String, bool)>,
+    write: impl FnOnce(&str) -> Result<(), Error>,
+    start: impl FnOnce(&str) -> Result<(), Error>,
+) -> Option<Result<(), Error>> {
+    let _g = lock.lock().unwrap_or_else(|e| e.into_inner());
+    let (id, running) = find()?;
+    if !running && let Err(e) = write(&id) {
+        return Some(Err(e));
+    }
+    Some(start(&id))
+}
+
+/// What the builder's registry tables come from: daemon.json's settings,
+/// and the registries the store's images came from that those settings
+/// reach without verified TLS (a network entry covers a registry only once
+/// an image from it is pulled).
+#[derive(Debug, PartialEq)]
+struct Registries {
+    config: std::sync::Arc<kiri_image::RegistryConfig>,
+    unverified: Vec<String>,
+}
+
+impl Registries {
+    fn now(names: &[String]) -> Registries {
+        let config = super::daemon_json::current();
+        let unverified = super::mirror::unverified(&config, names);
+        Registries { config, unverified }
+    }
+}
+
+/// [`Registries`] as the builder's config last had them, so a hand edit, or
+/// an image pulled from a registry inside a listed network, reaches a
+/// running builder at the next build. `None` until this daemon has written
+/// the file: a builder found running then (left from before the daemon
+/// started) may have anything, and is treated as stale.
+static WRITTEN: std::sync::Mutex<Option<std::sync::Arc<Registries>>> = std::sync::Mutex::new(None);
+
+/// Whether a running builder's registry settings are not today's.
+fn is_stale(written: Option<&Registries>, current: &Registries) -> bool {
+    written.is_none_or(|w| w != current)
+}
+
+/// The garbage collector's limits and the registries, for buildkitd's next
+/// start. [`WRITTEN`] says so only once the file is in place.
+fn write_config(engine: &Engine, id: &str) -> Result<(), Error> {
+    let names = super::mirror::registry_names(engine);
+    let current = Registries::now(&names);
+    let toml = config_toml(cache_limit(), &super::mirror::config(engine, &current.config, &names));
+    let archive = tar(&[("buildkit/", None), ("buildkit/buildkitd.toml", Some(toml.as_bytes()))]);
+    let written = copy_in(engine, id, "/etc", &mut io::Cursor::new(archive));
+    *WRITTEN.lock().unwrap_or_else(|e| e.into_inner()) = written.is_ok().then(|| std::sync::Arc::new(current));
+    if let Err(e) = written {
         crate::diag::warn!("builder config not written", error = format!("{e:?}"));
+        return Err(e);
     }
     if kiri_vmm::rosetta_installed() {
         hide_amd64_qemu(engine, id);
     }
+    Ok(())
+}
+
+/// Applies a changed registry setting to a stopped stale builder right
+/// away (when nothing holds [`ENSURE`] and the VM is awake), so its next
+/// start reads today's file. Never blocks on [`ENSURE`] and never stops a
+/// running builder: a running one is left stale for the next build
+/// ([`ensure_running`], [`before_exec`]) or the idle watch ([`watch`]).
+pub fn refresh(engine: &Engine) {
+    refresh_with(
+        &ENSURE,
+        || find(engine).map(|(id, st)| (id, st == Status::Running)),
+        || stale_now(engine),
+        || engine.is_awake(),
+        |id| {
+            let _ = write_config(engine, id);
+        },
+    );
+}
+
+fn refresh_with(
+    lock: &Mutex<()>,
+    find: impl FnOnce() -> Option<(String, bool)>,
+    stale: impl FnOnce() -> bool,
+    awake: impl FnOnce() -> bool,
+    write: impl FnOnce(&str),
+) {
+    let _g = match lock.try_lock() {
+        Ok(g) => g,
+        Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) => return,
+    };
+    let Some((id, running)) = find() else { return };
+    if refresh_action(running, stale()) == Refresh::WriteOnly && awake() {
+        write(&id);
+    }
+}
+
+/// Stops a running builder (resumed first, if Kiri paused it), and only
+/// then writes today's config, into a container nothing runs in: a builder
+/// that would not stop keeps running with what [`WRITTEN`] says it has.
+/// Returns `true` only once the builder has stopped and its config is written.
+fn stop_then_write(engine: &Engine, id: &str) -> bool {
+    stop_then_write_with(
+        engine.is_paused(id),
+        || engine.pause(id, false),
+        || engine.stop(id, Duration::from_secs(10)).map(|_| ()),
+        || write_config(engine, id).is_ok(),
+    )
+}
+
+fn stop_then_write_with(
+    paused: bool,
+    resume: impl FnOnce() -> Result<(), Error>,
+    stop: impl FnOnce() -> Result<(), Error>,
+    write: impl FnOnce() -> bool,
+) -> bool {
+    let (mut resume, mut stop, mut write) = (Some(resume), Some(stop), Some(write));
+    for step in STOP_THEN_WRITE {
+        match step {
+            Step::Resume if paused => {
+                if let Err(e) = resume.take().unwrap()() {
+                    crate::diag::warn!("builder not stopped after a settings change", error = format!("{e:?}"));
+                    return false;
+                }
+            }
+            Step::Resume => {}
+            Step::Stop => {
+                if let Err(e) = stop.take().unwrap()() {
+                    crate::diag::warn!("builder not stopped after a settings change", error = format!("{e:?}"));
+                    return false;
+                }
+            }
+            Step::Write => return write.take().unwrap()(),
+        }
+    }
+    true
+}
+
+/// The steps of [`stop_then_write`], in order.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum Step {
+    Resume,
+    Stop,
+    Write,
+}
+const STOP_THEN_WRITE: [Step; 3] = [Step::Resume, Step::Stop, Step::Write];
+
+/// Whether the config the builder runs with is not today's: daemon.json
+/// edited by hand, or a registry in a listed network pulled from, since it
+/// was written.
+fn stale_now(engine: &Engine) -> bool {
+    is_stale(WRITTEN.lock().unwrap_or_else(|e| e.into_inner()).as_deref(), &Registries::now(&super::mirror::registry_names(engine)))
+}
+
+/// Whether a builder is restarted with today's config now: only one that is
+/// running (or paused idle), with nothing using it, and a config not today's.
+fn restart_now(up: bool, busy: bool, stale: bool) -> bool {
+    up && !busy && stale
+}
+
+/// From the idle watch: a builder whose config is not today's, and that
+/// nothing uses, is stopped with today's config in place, so the next
+/// build, buildx's own included, starts it with that. Skipped while the
+/// builder is being made or started.
+fn refresh_if_stale(engine: &Engine) {
+    let _g = match ENSURE.try_lock() {
+        Ok(g) => g,
+        Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) => return,
+    };
+    let Some((id, status)) = find(engine) else { return };
+    if restart_now(status == Status::Running, builder_busy(engine, &id), stale_now(engine)) {
+        stop_then_write(engine, &id);
+    }
+}
+
+struct BuilderState {
+    id: String,
+    up: bool,
+    busy: bool,
+    stale: bool,
+}
+
+fn builder_state(engine: &Engine) -> Option<BuilderState> {
+    let (id, status) = find(engine)?;
+    Some(BuilderState { up: status == Status::Running, busy: builder_busy(engine, &id), stale: stale_now(engine), id })
+}
+
+/// `POST /containers/<builder>/exec` from buildx (its docker-container
+/// driver talks to buildkitd through an exec): a builder whose config is not
+/// today's, with nothing else using it, is restarted with today's first, so
+/// a build buildx starts reaches each registry as a pull does. Enters
+/// [`ENSURE`] for every builder exec so concurrent execs wait for an
+/// in-progress restart or start to finish before `exec_create` runs.
+pub fn before_exec(engine: &Engine, key: &str) {
+    // One lookup for an exec anywhere else.
+    let Ok(true) = engine.with(key, |c| c.name == container_name()) else { return };
+    before_exec_with(
+        &ENSURE,
+        || builder_state(engine),
+        |id| stop_then_write(engine, id),
+        |id| {
+            let restarted = engine.start(id).map_err(|e| format!("{e:?}")).and_then(|()| wait_ready(engine, id).map_err(|e| format!("{e:?}")));
+            match restarted {
+                Ok(()) => LAST_USE.store(now_secs(), Ordering::Relaxed),
+                Err(e) => crate::diag::warn!("builder not restarted with today's registries", error = e),
+            }
+        },
+    );
+}
+
+fn before_exec_with(
+    lock: &Mutex<()>,
+    recheck: impl FnOnce() -> Option<BuilderState>,
+    stop_write: impl FnOnce(&str) -> bool,
+    start: impl FnOnce(&str),
+) {
+    let _g = lock.lock().unwrap_or_else(|e| e.into_inner());
+    // Re-checked under ENSURE: another exec, a build or the idle watch may
+    // have refreshed, stopped, removed or started using the builder meanwhile.
+    let Some(state) = recheck() else { return };
+    if !restart_now(state.up, state.busy, state.stale) {
+        return;
+    }
+    if !stop_write(&state.id) {
+        return;
+    }
+    start(&state.id);
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum Refresh {
+    /// Not running and stale: the next start reads the new file.
+    WriteOnly,
+    /// Already fresh, or running (restarted on the next build or idle watch):
+    /// nothing is written and nothing stopped from a settings save.
+    Leave,
+}
+
+fn refresh_action(running: bool, stale: bool) -> Refresh {
+    if !running && stale { Refresh::WriteOnly } else { Refresh::Leave }
+}
+
+/// A build through the daemon, or a `buildx` session executing in the
+/// builder, is under way: stopping it now would cut that off.
+fn builder_busy(engine: &Engine, id: &str) -> bool {
+    BUILDS.load(Ordering::Relaxed) > 0 || engine.running_execs(id) > 0
 }
 
 /// BuildKit's x86-64 emulator, which it runs amd64 build steps under when it
@@ -298,21 +545,39 @@ fn ensure_running(engine: &Engine, say: &mut dyn FnMut(&str)) -> Result<String, 
         Some(found) => found,
         None => (create(engine, say)?, Status::Created),
     };
-    if status != Status::Running {
-        write_config(engine, &id);
+    // daemon.json edited by hand since the builder started (Settings and
+    // `kiri registry` refresh it at once): restarted with the new file
+    // while no build uses it, as buildkitd reads it only when it starts.
+    let stale = status == Status::Running
+        && !builder_busy(engine, &id)
+        && is_stale(WRITTEN.lock().unwrap_or_else(|e| e.into_inner()).as_deref(), &Registries::now(&super::mirror::registry_names(engine)));
+    if stale {
+        if engine.is_paused(&id) {
+            engine.pause(&id, false)?;
+        }
+        engine.stop(&id, Duration::from_secs(10))?;
+    }
+    if status != Status::Running || stale {
+        write_config(engine, &id)?;
         say("Starting Kiri's builder (BuildKit)");
         engine.start(&id)?;
     } else if engine.is_paused(&id) {
         engine.pause(&id, false)?;
     }
     LAST_USE.store(now_secs(), Ordering::Relaxed);
+    wait_ready(engine, &id)?;
+    Ok(id)
+}
+
+/// Waits for a started builder's buildkitd to answer.
+fn wait_ready(engine: &Engine, id: &str) -> Result<(), Error> {
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
-        if let Ok((0, _)) = engine.exec_capture(&id, &["buildctl", "debug", "workers"]) {
-            return Ok(id);
+        if let Ok((0, _)) = engine.exec_capture(id, &["buildctl", "debug", "workers"]) {
+            return Ok(());
         }
         if find(engine).is_none_or(|(_, s)| s != Status::Running) || Instant::now() > deadline {
-            let text: Vec<u8> = engine.logs(&id, false).ok().flatten().map(|l| l.past.tail(Some(5)).flat_map(|r| r.data).collect()).unwrap_or_default();
+            let text: Vec<u8> = engine.logs(id, false).ok().flatten().map(|l| l.past.tail(Some(5)).flat_map(|r| r.data).collect()).unwrap_or_default();
             let text = String::from_utf8_lossy(&text);
             let tail: Vec<&str> = text.lines().collect();
             return Err(Error::Io(io::Error::other(format!("Kiri's builder (BuildKit) did not start: {}", tail.join(" / ")))));
@@ -335,6 +600,14 @@ pub fn watch(engine: Arc<Engine>) {
             LAST_USE.store(0, Ordering::Relaxed);
             continue;
         };
+        // daemon.json edited by hand, a registry in a listed network pulled
+        // from, or a setting saved while a build ran: the builder is put on
+        // today's config as soon as nothing uses it, running or paused.
+        if refresh_due(&engine, &id) {
+            refresh_if_stale(&engine);
+            LAST_USE.store(0, Ordering::Relaxed);
+            continue;
+        }
         // Paused already: once something resumes it, it gets a full idle
         // time again (counted from the first look at it running).
         if engine.is_paused(&id) {
@@ -360,6 +633,11 @@ pub fn watch(engine: Arc<Engine>) {
         }
         LAST_USE.store(0, Ordering::Relaxed);
     });
+}
+
+/// Whether the idle watch restarts the builder for its config now.
+fn refresh_due(engine: &Engine, id: &str) -> bool {
+    restart_now(true, builder_busy(engine, id), stale_now(engine))
 }
 
 /// A build in progress, for the idle watch.
@@ -1059,6 +1337,332 @@ fn du_rows(text: &str) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A busy builder (a build, or a buildx session) is never stopped, and
+    /// its recorded config is not advanced.
+    #[test]
+    fn a_builder_whose_config_is_unknown_or_old_is_stale() {
+        let r = |c: kiri_image::RegistryConfig, unverified: &[&str]| Registries { config: std::sync::Arc::new(c), unverified: unverified.iter().map(|s| s.to_string()).collect() };
+        let none = r(kiri_image::RegistryConfig::default(), &[]);
+        let some = r(kiri_image::RegistryConfig { insecure: vec![kiri_image::Insecure::parse("registry.lan:5000").unwrap()], ..Default::default() }, &[]);
+        assert!(is_stale(None, &none), "never written by this daemon");
+        assert!(is_stale(Some(&none), &some));
+        assert!(!is_stale(Some(&some), &some));
+    }
+
+    /// An image pulled from a registry inside a listed network, after the
+    /// builder started, makes it stale: its config has no table for it.
+    #[test]
+    fn a_registry_pulled_from_inside_a_listed_network_makes_the_builder_stale() {
+        let c = std::sync::Arc::new(kiri_image::RegistryConfig { insecure: vec![kiri_image::Insecure::parse("10.0.0.0/8").unwrap()], ..Default::default() });
+        let names = |n: &[&str]| n.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let before = Registries { config: c.clone(), unverified: super::super::mirror::unverified(&c, &names(&["docker.io"])) };
+        let after = Registries { config: c.clone(), unverified: super::super::mirror::unverified(&c, &names(&["docker.io", "ghcr.io", "10.1.2.3:5000"])) };
+        assert_eq!(after.unverified, ["10.1.2.3:5000"]);
+        assert!(is_stale(Some(&before), &after));
+        // A registry outside the list changes nothing.
+        let other = Registries { config: c.clone(), unverified: super::super::mirror::unverified(&c, &names(&["docker.io", "ghcr.io"])) };
+        assert!(!is_stale(Some(&before), &other));
+    }
+
+    /// A builder on an old config is restarted only when it is up and
+    /// nothing uses it; and it is stopped before its new config is written,
+    /// so one that will not stop keeps what it is recorded as running with.
+    #[test]
+    fn a_stale_builder_is_restarted_only_when_idle_and_stopped_before_its_config_is_written() {
+        assert!(restart_now(true, false, true));
+        assert!(!restart_now(true, true, true), "a build or a buildx session is under way");
+        assert!(!restart_now(false, false, true), "the next start writes today's config");
+        assert!(!restart_now(true, false, false));
+        let at = |s: Step| STOP_THEN_WRITE.iter().position(|x| *x == s).unwrap();
+        assert!(at(Step::Resume) < at(Step::Stop) && at(Step::Stop) < at(Step::Write), "{STOP_THEN_WRITE:?}");
+    }
+
+    /// `before_exec` re-checks the builder's state under `ENSURE` (so a waiter
+    /// never kills a builder that became busy, fresh, stopped or gone while
+    /// waiting), and never starts the builder if resuming, stopping or writing
+    /// its config failed.
+    #[test]
+    fn before_exec_rechecks_under_lock_and_skips_start_when_stop_fails() {
+        // 1. State changed while waiting on the lock: nothing stopped or started.
+        let cases: Vec<(&str, Option<BuilderState>)> = vec![
+            ("now busy", Some(BuilderState { id: "b1".into(), up: true, busy: true, stale: true })),
+            ("already fresh", Some(BuilderState { id: "b1".into(), up: true, busy: false, stale: false })),
+            ("already stopped", Some(BuilderState { id: "b1".into(), up: false, busy: false, stale: true })),
+            ("gone", None),
+        ];
+        for (label, under_lock) in cases {
+            let lock = Arc::new(Mutex::new(()));
+            let held = lock.lock().unwrap();
+            let shared: Arc<Mutex<Option<BuilderState>>> = Arc::new(Mutex::new(Some(BuilderState { id: "b1".into(), up: true, busy: false, stale: true })));
+            let actions: Arc<Mutex<Vec<String>>> = Arc::default();
+            let waiter = std::thread::spawn({
+                let (lock, shared, actions) = (lock.clone(), shared.clone(), actions.clone());
+                move || {
+                    before_exec_with(
+                        &lock,
+                        || shared.lock().unwrap().take(),
+                        |id| {
+                            actions.lock().unwrap().push(format!("stop:{id}"));
+                            true
+                        },
+                        |id| actions.lock().unwrap().push(format!("start:{id}")),
+                    );
+                }
+            });
+            // Mutate state while holding the lock, then release it.
+            *shared.lock().unwrap() = under_lock;
+            drop(held);
+            waiter.join().unwrap();
+            assert!(actions.lock().unwrap().is_empty(), "{label}: {:?}", actions.lock().unwrap());
+        }
+
+        // 2. Resume, stop or config write fails: start is never called.
+        let err = || Err(Error::Conflict("boom".into()));
+        let steps = std::cell::RefCell::new(Vec::new());
+        assert!(!stop_then_write_with(
+            true,
+            || {
+                steps.borrow_mut().push("resume");
+                err()
+            },
+            || {
+                steps.borrow_mut().push("stop");
+                Ok(())
+            },
+            || {
+                steps.borrow_mut().push("write");
+                true
+            },
+        ));
+        assert_eq!(*steps.borrow(), ["resume"]);
+
+        steps.borrow_mut().clear();
+        assert!(!stop_then_write_with(
+            false,
+            || {
+                steps.borrow_mut().push("resume");
+                Ok(())
+            },
+            || {
+                steps.borrow_mut().push("stop");
+                err()
+            },
+            || {
+                steps.borrow_mut().push("write");
+                true
+            },
+        ));
+        assert_eq!(*steps.borrow(), ["stop"]);
+
+        let lock = Mutex::new(());
+        let mut started = false;
+        before_exec_with(
+            &lock,
+            || Some(BuilderState { id: "b1".into(), up: true, busy: false, stale: true }),
+            |_| stop_then_write_with(false, || Ok(()), err, || true),
+            |_| started = true,
+        );
+        assert!(!started, "must not start when stop failed");
+
+        before_exec_with(
+            &lock,
+            || Some(BuilderState { id: "b1".into(), up: true, busy: false, stale: true }),
+            |_| stop_then_write_with(false, || Ok(()), || Ok(()), || false),
+            |_| started = true,
+        );
+        assert!(!started, "must not start when config write failed");
+
+        // 3. Still running, idle and stale under the lock, and stop+write
+        // succeed: restarts the re-fetched container id.
+        let log = std::cell::RefCell::new(Vec::new());
+        before_exec_with(
+            &lock,
+            || Some(BuilderState { id: "b2".into(), up: true, busy: false, stale: true }),
+            |id| {
+                log.borrow_mut().push(format!("stop:{id}"));
+                stop_then_write_with(
+                    true,
+                    || {
+                        log.borrow_mut().push("resume".into());
+                        Ok(())
+                    },
+                    || {
+                        log.borrow_mut().push("stop".into());
+                        Ok(())
+                    },
+                    || {
+                        log.borrow_mut().push("write".into());
+                        true
+                    },
+                )
+            },
+            |id| log.borrow_mut().push(format!("start:{id}")),
+        );
+        assert_eq!(*log.borrow(), ["stop:b2", "resume", "stop", "write", "start:b2"]);
+    }
+
+    /// `before_exec` enters `ENSURE` for the builder without an unlocked
+    /// `restart_now` early return, so a concurrent exec waits while another
+    /// request is restarting or starting the builder; execs for other
+    /// containers never block on `ENSURE`.
+    #[test]
+    fn before_exec_waits_on_ensure_while_builder_is_restarting() {
+        use std::io::Write as _;
+        let dir = std::env::temp_dir().join(format!("kiri-builder-before-exec-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = kiri_image::Store::open(&dir).unwrap();
+        let cfg = json!({"created": "2026-11-16T00:00:00Z", "architecture": "arm64", "os": "linux", "config": {"Cmd": ["sh"]}});
+        let mut w = store.ingest().unwrap();
+        w.write_all(&serde_json::to_vec(&cfg).unwrap()).unwrap();
+        let (digest, _) = w.finish().unwrap();
+        store.put_image(kiri_image::archive::from_config("demo:1".into(), &digest, &cfg, Vec::new())).unwrap();
+        let engine = Engine::boot(store).unwrap();
+        let make = |name: &str| {
+            let body = json!({"Image": "demo:1", "HostConfig": {"NetworkMode": "none"}});
+            let req = Request::internal("POST", "/containers/create", &[("name", name)], serde_json::to_vec(&body).unwrap());
+            api::create(&req, &engine).unwrap()["Id"].as_str().unwrap().to_owned()
+        };
+        let builder_id = make(&container_name());
+        let other_id = make("other");
+
+        // Hold ENSURE to simulate an in-progress builder restart (where the
+        // builder is momentarily not running: Status::Created / Exited).
+        let held = ENSURE.lock().unwrap_or_else(|e| e.into_inner());
+
+        // Exec on a non-builder container returns without waiting on ENSURE.
+        before_exec(&engine, &other_id);
+
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let waiter = std::thread::spawn({
+            let (engine, builder_id) = (engine.clone(), builder_id.clone());
+            move || {
+                let _ = entered_tx.send(());
+                before_exec(&engine, &builder_id);
+                let _ = done_tx.send(());
+            }
+        });
+        entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let waited = matches!(done_rx.recv_timeout(Duration::from_millis(100)), Err(RecvTimeoutError::Timeout));
+        drop(held);
+        if waited {
+            done_rx.recv_timeout(Duration::from_secs(2)).expect("waiter must resume once ENSURE is released");
+        }
+        waiter.join().unwrap();
+        drop(engine);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(waited, "before_exec must wait on ENSURE while the builder is stopped mid-restart");
+    }
+
+    #[test]
+    fn a_settings_change_never_stops_a_running_builder() {
+        assert_eq!(refresh_action(true, true), Refresh::Leave);
+        assert_eq!(refresh_action(true, false), Refresh::Leave);
+        assert_eq!(refresh_action(false, true), Refresh::WriteOnly);
+        assert_eq!(refresh_action(false, false), Refresh::Leave);
+    }
+
+    /// `refresh` checks staleness under `ENSURE`, never blocks on `ENSURE`,
+    /// never stops a running builder, and never wakes a sleeping VM; `start`
+    /// writes today's config and starts a stopped builder under `ENSURE`.
+    #[test]
+    fn refresh_checks_staleness_and_start_writes_config_under_lock() {
+        // 1. Fresh stopped builder: refresh does not write.
+        let lock = Mutex::new(());
+        let mut wrote = false;
+        refresh_with(&lock, || Some(("b1".into(), false)), || false, || true, |_| wrote = true);
+        assert!(!wrote, "fresh builder must not be rewritten");
+
+        // 2. Running stale builder: refresh neither stops nor writes.
+        refresh_with(&lock, || Some(("b1".into(), true)), || true, || true, |_| wrote = true);
+        assert!(!wrote, "running builder must not be written or stopped by refresh");
+
+        // 3. Stopped stale builder while VM is asleep: refresh does not wake it.
+        refresh_with(&lock, || Some(("b1".into(), false)), || true, || false, |_| wrote = true);
+        assert!(!wrote, "sleeping VM must not be woken by refresh");
+
+        // 4. Stopped stale builder while VM is awake: writes under lock.
+        let mut locked_during_write = false;
+        refresh_with(&lock, || Some(("b1".into(), false)), || true, || true, |_| {
+            wrote = true;
+            locked_during_write = lock.try_lock().is_err();
+        });
+        assert!(wrote && locked_during_write);
+
+        // 5. Lock held: refresh returns immediately without blocking.
+        let held = lock.lock().unwrap();
+        let touched = std::cell::Cell::new(false);
+        refresh_with(
+            &lock,
+            || {
+                touched.set(true);
+                Some(("b1".into(), false))
+            },
+            || true,
+            || true,
+            |_| touched.set(true),
+        );
+        drop(held);
+        assert!(!touched.get(), "refresh must not block on ENSURE");
+
+        // 6. start_with: stopped stale builder writes config AND starts while
+        // holding ENSURE; an already-running builder under ENSURE is not written.
+        let log = std::cell::RefCell::new(Vec::new());
+        let res = start_with(
+            &lock,
+            || Some(("b1".into(), false)),
+            |id| {
+                assert!(lock.try_lock().is_err(), "ENSURE must be held during write");
+                log.borrow_mut().push(format!("write:{id}"));
+                Ok(())
+            },
+            |id| {
+                assert!(lock.try_lock().is_err(), "ENSURE must be held during start");
+                log.borrow_mut().push(format!("start:{id}"));
+                Ok(())
+            },
+        );
+        assert!(matches!(res, Some(Ok(()))));
+        assert_eq!(*log.borrow(), ["write:b1", "start:b1"]);
+
+        log.borrow_mut().clear();
+        let res = start_with(
+            &lock,
+            || Some(("b1".into(), true)),
+            |id| {
+                log.borrow_mut().push(format!("write:{id}"));
+                Ok(())
+            },
+            |id| {
+                log.borrow_mut().push(format!("start:{id}"));
+                Ok(())
+            },
+        );
+        assert!(matches!(res, Some(Ok(()))));
+        assert_eq!(*log.borrow(), ["start:b1"], "already running builder must not be written into");
+
+        assert!(start_with(&lock, || None, |_| panic!("wrote"), |_| panic!("started")).is_none());
+    }
+
+    /// `start` does not boot the builder when writing `buildkitd.toml` fails,
+    /// returning the write error instead of starting with stale config.
+    #[test]
+    fn start_aborts_when_writing_config_fails() {
+        let lock = Mutex::new(());
+        let mut started = false;
+        let res = start_with(
+            &lock,
+            || Some(("b1".into(), false)),
+            |_| Err(Error::Io(io::Error::other("copy_in failed"))),
+            |_| {
+                started = true;
+                Ok(())
+            },
+        );
+        assert!(!started, "must not start builder when write_config fails");
+        assert!(matches!(res, Some(Err(Error::Io(ref e))) if e.to_string().contains("copy_in failed")), "{res:?}");
+    }
 
     /// BuildKit looks the emulator up by name and skips it when it isn't
     /// executable, so the file taking its place must be a plain 0644 file.

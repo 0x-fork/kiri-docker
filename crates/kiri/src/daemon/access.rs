@@ -191,7 +191,8 @@ fn member(uid: u32, group: &CStr) -> io::Result<bool> {
 /// stay connected.
 pub struct Gate {
     group: CString,
-    socket: PathBuf,
+    /// The daemon's socket, and the one containers are given (caller.rs).
+    sockets: Vec<PathBuf>,
     owner: u32,
     open: Mutex<HashMap<u64, (u32, UnixStream)>>,
     next: AtomicU64,
@@ -214,11 +215,11 @@ impl Drop for Seat {
 }
 
 impl Gate {
-    pub fn new(socket: &Path, group: &OsStr) -> io::Result<Arc<Gate>> {
+    pub fn new(sockets: &[&Path], group: &OsStr) -> io::Result<Arc<Gate>> {
         let group = CString::new(group.as_bytes()).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
         // SAFETY: geteuid cannot fail.
         let owner = unsafe { libc::geteuid() };
-        Ok(Arc::new(Gate { group, socket: socket.to_owned(), owner, open: Mutex::default(), next: AtomicU64::new(0), failing: AtomicBool::new(false), recent: Mutex::default() }))
+        Ok(Arc::new(Gate { group, sockets: sockets.iter().map(|s| s.to_path_buf()).collect(), owner, open: Mutex::default(), next: AtomicU64::new(0), failing: AtomicBool::new(false), recent: Mutex::default() }))
     }
 
     fn name(&self) -> std::borrow::Cow<'_, str> {
@@ -268,7 +269,7 @@ impl Gate {
             return;
         }
         // Only a list actually written counts: anything else is tried again.
-        let written = group.as_ref().map_or(Ok(Vec::new()), |g| uids_of(&g.rec)).and_then(|uids| set(&self.socket, &uids).map(|()| uids.len()));
+        let written = group.as_ref().map_or(Ok(Vec::new()), |g| uids_of(&g.rec)).and_then(|uids| self.set_all(&uids).map(|()| uids.len()));
         match written {
             Ok(n) => {
                 crate::diag::info!("socket access list written", members = n);
@@ -282,8 +283,13 @@ impl Gate {
     /// Writes the socket's access list for the group's current members.
     pub fn grant(&self) -> io::Result<usize> {
         let uids = member_uids(&self.group)?;
-        set(&self.socket, &uids)?;
+        self.set_all(&uids)?;
         Ok(uids.len())
+    }
+
+    /// Writes each socket's access list.
+    fn set_all(&self, uids: &[u32]) -> io::Result<()> {
+        set_each(&self.sockets, uids, set)
     }
 
     /// Checks a new connection. `None`: refused, and the reason logged.
@@ -385,6 +391,18 @@ pub fn set(socket: &Path, uids: &[u32]) -> io::Result<()> {
     if r == 0 { Ok(()) } else { Err(io::Error::last_os_error()) }
 }
 
+/// Writes the access list of every one of `sockets` with `set`, each tried
+/// whatever became of the one before; the first error, if any.
+fn set_each(sockets: &[PathBuf], uids: &[u32], set: impl Fn(&Path, &[u32]) -> io::Result<()>) -> io::Result<()> {
+    let mut first = Ok(());
+    for s in sockets {
+        if let Err(e) = set(s, uids) {
+            first = first.and(Err(e));
+        }
+    }
+    first
+}
+
 /// Whether a failure to write the list means this system can't keep one
 /// (a filesystem without ACLs): then only signing in again lets a new member in.
 pub fn unsupported(e: &io::Error) -> bool {
@@ -424,6 +442,20 @@ fn acl(uids: &[u32]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// One socket's list that cannot be written does not keep the next
+    /// from being written; the error is still reported.
+    #[test]
+    fn every_sockets_list_is_written_when_one_fails() {
+        let sockets = [PathBuf::from("/run/a.sock"), PathBuf::from("/run/b.sock")];
+        let written = Mutex::new(Vec::new());
+        let r = set_each(&sockets, &[1000], |s, _| {
+            written.lock().unwrap().push(s.to_path_buf());
+            if s.ends_with("a.sock") { Err(io::Error::other("no")) } else { Ok(()) }
+        });
+        assert!(r.is_err());
+        assert_eq!(*written.lock().unwrap(), sockets);
+    }
 
     #[test]
     fn acl_lists_each_user_once_in_order_and_not_root() {
@@ -500,7 +532,7 @@ mod tests {
     }
 
     fn gate() -> Arc<Gate> {
-        let mut g = Gate::new(Path::new("/nonexistent"), OsStr::new("kiri")).unwrap();
+        let mut g = Gate::new(&[Path::new("/nonexistent")], OsStr::new("kiri")).unwrap();
         Arc::get_mut(&mut g).unwrap().owner = u32::MAX;
         g
     }
@@ -509,7 +541,7 @@ mod tests {
     fn root_and_the_daemons_own_account_need_no_group() {
         let g = gate();
         assert!(g.allowed(0).unwrap());
-        let mut g2 = Gate::new(Path::new("/nonexistent"), OsStr::new("kiri-no-such-group-x")).unwrap();
+        let mut g2 = Gate::new(&[Path::new("/nonexistent")], OsStr::new("kiri-no-such-group-x")).unwrap();
         Arc::get_mut(&mut g2).unwrap().owner = 4242;
         assert!(g2.allowed(4242).unwrap());
         assert!(!g2.allowed(4243).unwrap(), "anyone else is looked up");
@@ -593,7 +625,7 @@ mod tests {
         set(&sock, &[65534]).unwrap();
         assert!(try_as(65534));
         let (conn, _) = listener.accept().unwrap();
-        let mut gate = Gate::new(&sock, OsStr::new("root")).unwrap();
+        let mut gate = Gate::new(&[sock.as_path()], OsStr::new("root")).unwrap();
         Arc::get_mut(&mut gate).unwrap().owner = u32::MAX;
         assert!(gate.admit(&conn).is_none(), "nobody is not in root's group");
         std::fs::remove_dir_all(&dir).unwrap();
@@ -622,7 +654,7 @@ mod tests {
         let sock = dir.join("s.sock");
         let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
         std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o660)).unwrap();
-        let mut gate = Gate::new(&sock, OsStr::new("kiritestg")).unwrap();
+        let mut gate = Gate::new(&[sock.as_path()], OsStr::new("kiritestg")).unwrap();
         Arc::get_mut(&mut gate).unwrap().owner = u32::MAX;
         assert_eq!(gate.grant().unwrap(), 1);
 

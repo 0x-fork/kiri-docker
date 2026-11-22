@@ -1230,6 +1230,14 @@ pub fn on_message(msg: &str) {
             let body = c.value;
             std::thread::spawn(move || proxy(Some(body)));
         }
+        // Settings → Registries: daemon.json's lists, in the engine's distro.
+        "registryconfig" => {
+            std::thread::spawn(|| registry_config(None));
+        }
+        "setregistryconfig" => {
+            let body = c.value;
+            std::thread::spawn(move || registry_config(Some(body)));
+        }
         // Settings → Resources: WSL's CPUs and memory, in .wslconfig.
         "resources" => crate::wslconfig::resources(None),
         "setresources" => crate::wslconfig::resources(Some(c.value)),
@@ -1480,6 +1488,32 @@ fn proxy(set: Option<Value>) {
         }
         Err(e) => json!({"type": "proxy", "error": e.to_string()}),
     };
+    emit(ev.to_string());
+}
+
+/// Settings → Registries: the engine's daemon.json (in its WSL distro):
+/// insecure registries and Docker Hub mirrors.
+/// The answer to a save says whether it was saved (`saved`), so the page
+/// knows its own save's answer from a read that crossed it.
+fn registry_config(set: Option<Value>) {
+    let saved = set.map(|body| match expect_ok(client::request("POST", "/kiri/registries", Some(&body))) {
+        Ok(()) => {
+            emit(notice("ok", &tr("Registry settings saved")));
+            true
+        }
+        Err(e) => {
+            emit(notice("error", &trf("Could not save the registry settings: {error}", &[("error", &e)])));
+            false
+        }
+    });
+    let mut ev = match client::get("/kiri/registries") {
+        Ok(v) => v,
+        Err(e) => json!({"error": e.to_string()}),
+    };
+    ev["type"] = json!("registryconfig");
+    if let Some(saved) = saved {
+        ev["saved"] = json!(saved);
+    }
     emit(ev.to_string());
 }
 
