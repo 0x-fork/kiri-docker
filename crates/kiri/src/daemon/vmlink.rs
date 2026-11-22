@@ -524,6 +524,16 @@ impl VmLink {
         self.ack(|o| Msg::NetDetach { id, ifname: &ifname, bridge, ip }.encode(o))
     }
 
+    /// Replaces the DNS names the guest resolves for a container's address
+    /// on a bridge after `docker rename`; `v4` is whether the network has
+    /// IPv4 addresses. No reply, which is why the protocol is 8: an older
+    /// agent would answer an unknown frame with an error, and the next
+    /// request would take it for its own reply. The guest refuses a frame
+    /// that names no running container's address.
+    pub fn dns_rename(&self, id: &str, bridge: &str, ip: [u8; 4], ip6: Option<[u8; 16]>, v4: bool, names: &[String]) -> io::Result<()> {
+        self.send(|o| kiri_proto::encode_dns_rename(o, id, bridge, ip, ip6, v4, names))
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn exec(&self, container_id: &str, exec_id: &str, argv: &[String], env: &[String], cwd: &str, user: &str, flags: u32, caps: u64, opts: &[String]) -> io::Result<u32> {
         self.windows.open(exec_id);
