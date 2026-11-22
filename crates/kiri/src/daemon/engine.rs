@@ -4689,6 +4689,9 @@ impl Engine {
     }
 }
 
+/// The `--dns` servers a container uses, as with Docker.
+const MAX_DNS_SERVERS: usize = 3;
+
 /// A Docker event in Kiri's log: containers and images coming and going,
 /// with name, image and exit code; never labels (they can hold anything).
 /// A BuildKit container's exec is a build session (`docker build`).
@@ -4702,7 +4705,25 @@ fn net_opts(spec: &Spec, joined: Option<&str>, domainname: &str) -> Vec<String> 
     if !spec.mac_address.is_empty() {
         opts.push(format!("{}={}", k::MAC, spec.mac_address));
     }
-    opts.extend(spec.dns.iter().map(|d| format!("{}={d}", k::NAMESERVER)));
+    // The embedded DNS asks the first three IPv4 `--dns` servers, as Docker
+    // does: later IPv4 ones are left out. IPv6 ones (for resolv.conf, which
+    // the embedded DNS doesn't ask) don't take an IPv4 server's place, and
+    // are bounded to three as well.
+    let is_v4 = |d: &&String| d.parse::<std::net::Ipv4Addr>().is_ok();
+    let v4 = spec.dns.iter().filter(is_v4).count();
+    let other = spec.dns.len() - v4;
+    if v4 > MAX_DNS_SERVERS || other > MAX_DNS_SERVERS {
+        crate::diag::warn!("more than three IPv4 or other --dns servers: only the first three of each are used", given = spec.dns.len());
+    }
+    let (mut kept4, mut kept_other) = (0, 0);
+    for d in &spec.dns {
+        let kept = if is_v4(&d) { &mut kept4 } else { &mut kept_other };
+        if *kept == MAX_DNS_SERVERS {
+            continue;
+        }
+        *kept += 1;
+        opts.push(format!("{}={d}", k::NAMESERVER));
+    }
     opts.extend(spec.dns_search.iter().map(|d| format!("{}={d}", k::SEARCH)));
     opts.extend(spec.dns_options.iter().map(|d| format!("{}={d}", k::OPTION)));
     if !domainname.is_empty() {
@@ -5928,6 +5949,44 @@ mod net_opts_tests {
         }))
         .unwrap();
         assert!(super::net_opts(&old, None, "").is_empty());
+    }
+
+    /// The cap on `--dns` servers counts IPv4 ones: IPv6 servers ahead of
+    /// them don't push an IPv4 server out, and a fourth IPv4 one is left out.
+    #[test]
+    fn the_first_three_ipv4_dns_servers_are_kept() {
+        let spec: super::Spec = serde_json::from_value(serde_json::json!({
+            "image": "alpine", "image_id": "sha256:x", "entrypoint": [], "cmd": ["sh"], "env": [], "cwd": "", "user": "",
+            "auto_remove": false, "network_mode": "bridge", "labels": {},
+            "dns": ["2001:db8::1", "2001:db8::2", "2001:db8::3", "10.0.0.1", "10.0.0.2", "10.0.0.3", "10.0.0.4"],
+        }))
+        .unwrap();
+        assert_eq!(
+            super::net_opts(&spec, None, ""),
+            [
+                "nameserver=2001:db8::1",
+                "nameserver=2001:db8::2",
+                "nameserver=2001:db8::3",
+                "nameserver=10.0.0.1",
+                "nameserver=10.0.0.2",
+                "nameserver=10.0.0.3"
+            ]
+        );
+    }
+
+    /// IPv6 `--dns` entries are bounded to three as well.
+    #[test]
+    fn at_most_three_ipv6_dns_servers_are_kept() {
+        let spec: super::Spec = serde_json::from_value(serde_json::json!({
+            "image": "alpine", "image_id": "sha256:x", "entrypoint": [], "cmd": ["sh"], "env": [], "cwd": "", "user": "",
+            "auto_remove": false, "network_mode": "bridge", "labels": {},
+            "dns": ["2001:db8::1", "2001:db8::2", "2001:db8::3", "2001:db8::4", "10.0.0.1"],
+        }))
+        .unwrap();
+        assert_eq!(
+            super::net_opts(&spec, None, ""),
+            ["nameserver=2001:db8::1", "nameserver=2001:db8::2", "nameserver=2001:db8::3", "nameserver=10.0.0.1"]
+        );
     }
 }
 
